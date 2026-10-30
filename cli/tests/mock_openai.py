@@ -22,8 +22,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 class MockConfig:
     first_token_delay_s: float = 0.05
     inter_token_delay_s: float = 0.01
-    tokens: int = 8  # max_tokens 가 더 작으면 그쪽을 따른다
-    fail_every: int = 0  # n 번째 요청마다 500. 0 이면 실패 없음
+    tokens: int = 8  # 본문 토큰 수. 추론 토큰과 합해 max_tokens 를 넘으면 잘린다
+    reasoning_tokens: int = 0  # 본문 앞에 reasoning_content 로 보낼 토큰 수
+    fail_requests: frozenset[int] = frozenset()  # 500 을 돌려줄 요청 번호 (1부터, 준비 확인 포함)
     send_usage: bool = True
 
 
@@ -43,10 +44,14 @@ def make_app(cfg: MockConfig, state: MockState) -> FastAPI:
         body = await req.json()
         state.requests += 1
         state.bodies.append(body)
-        if cfg.fail_every and state.requests % cfg.fail_every == 0:
+        if state.requests in cfg.fail_requests:
             return JSONResponse({"error": {"message": "mock failure"}}, status_code=500)
 
-        n = min(cfg.tokens, body.get("max_tokens") or cfg.tokens)
+        limit = body.get("max_tokens") or (cfg.reasoning_tokens + cfg.tokens)
+        n_reason = min(cfg.reasoning_tokens, limit)
+        n_content = min(cfg.tokens, limit - n_reason)
+        n = n_reason + n_content
+        finish = "length" if cfg.reasoning_tokens + cfg.tokens > limit else "stop"
 
         async def gen():
             state.in_flight += 1
@@ -59,11 +64,14 @@ def make_app(cfg: MockConfig, state: MockState) -> FastAPI:
                 for i in range(n):
                     if i:
                         await asyncio.sleep(cfg.inter_token_delay_s)
-                    chunk = {**base, "choices": [{"index": 0, "delta": {"content": f"t{i} "}}]}
+                    key = "reasoning_content" if i < n_reason else "content"
+                    chunk = {**base, "choices": [{"index": 0, "delta": {key: f"t{i} "}}]}
                     yield f"data: {json.dumps(chunk)}\n\n"
-                yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'length'}]})}\n\n"
+                yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}]})}\n\n"
                 if cfg.send_usage and (body.get("stream_options") or {}).get("include_usage"):
                     usage = {"prompt_tokens": 5, "completion_tokens": n, "total_tokens": 5 + n}
+                    if cfg.reasoning_tokens:
+                        usage["completion_tokens_details"] = {"reasoning_tokens": n_reason}
                     yield f"data: {json.dumps({**base, 'choices': [], 'usage': usage})}\n\n"
                 yield "data: [DONE]\n\n"
             finally:

@@ -196,6 +196,26 @@ def probe_host() -> HostProbe:
     return HostProbe(gpus, driver, cuda, src, interconnect, cpu, ram)
 
 
+def parse_temps(text: str) -> float | None:
+    """`nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits` → 여러 장이면 최댓값."""
+    temps = []
+    for line in text.splitlines():
+        try:
+            temps.append(float(line.strip()))
+        except ValueError:
+            continue
+    return max(temps) if temps else None
+
+
+def gpu_temperature_c() -> float | None:
+    """현재 GPU 온도(°C). nvidia-smi 가 없거나 읽지 못하면 None."""
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return None
+    out = _run([smi, "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
+    return parse_temps(out) if out else None
+
+
 # ---------------------------------------------------------------- 엔진
 
 

@@ -53,8 +53,16 @@ engine:
 load:
   concurrency, input_tokens, output_tokens, request_count, warmup_count,
   mode (closed_loop|open_loop), arrival_rate_rps, arrival_process (poisson|constant),
-  random_seed
+  random_seed,
+  sampling: {temperature, top_p, repetition_penalty, max_tokens, stop: [str]}   # null 불가, 측정 시 반드시 기록
+  reasoning_enabled (bool|null), reasoning_budget_tokens (int|null)
   # closed_loop 이면 arrival_rate_rps·arrival_process 는 null, open_loop 이면 필수
+  # reasoning_budget_tokens 는 reasoning_enabled=true 일 때만
+
+conditions:                           # 측정 당시 조건
+  model_load_state (cold|warm), colocated_workloads (bool|null), shared_tenancy_note,
+  gpu_temp_start_c, gpu_temp_end_c (측정 구간 시작·종료, nvidia-smi, 여러 장이면 최댓값),
+  chat_template_variant (템플릿 이름 또는 해시)
 
 result:
   ttft_p50_ms, ttft_p95_ms, ttft_p99_ms,
@@ -66,9 +74,15 @@ result:
   duration_s,
   energy_total_j, energy_per_output_token_j,
   output_tokens_actual_mean, token_count_source (engine_usage|client_tokenizer|null),
-  per_request: [{ttft_ms, e2e_ms, tpot_ms, output_tokens}]   # 측정 구간 요청 전부(실패 포함), 길이 = request_count
+  reasoning_tokens_mean, content_tokens_mean (엔진이 분리해 주지 않으면 null),
+  finish_reason_counts: {stop, length, error, other}   # 합 == request_count, error == error_count
+  content_empty_rate (성공했지만 본문이 빈 요청 수 / request_count),
+  prefix_cache_hit_rate (엔진 메트릭, 없으면 null),
+  per_request: [{ttft_ms, e2e_ms, tpot_ms, output_tokens, finish_reason, reasoning_tokens}]
+    # 측정 구간 요청 전부(실패 포함), 길이 = request_count, finish_reason 집계 = finish_reason_counts
 
 # 모든 키는 필수. 재지 못한 값은 null (생략 아님). token_count_source 가 null 이면 토큰 수 필드도 null.
+# reasoning_enabled=true 인데 reasoning_tokens_mean=null 이면 경고(거부 아님) — 사이트에서 "추론 토큰 미분리"로 구분 표시.
 ```
 
 ### 1.2 측정 격자 (v1)
@@ -93,7 +107,9 @@ result:
 **엔진**: vLLM 최신 안정 버전 1개로 고정. 버전은 레코드에 박힌다.
 
 ### 1.4 측정 규칙
+- 워밍업 전에 실제 생성 요청 1건으로 준비 확인. `/v1/models` 200 은 준비 확인이 아니다. 실패하면 측정 시작 안 함.
 - 워밍업 요청 N개 후 측정 시작.
+- 측정 구간 시작·종료 시 `nvidia-smi` 로 GPU 온도 기록 (없으면 null).
 - 입력 프롬프트는 고정 시드 랜덤 토큰 (캐시 효과 제거). 한국어 토큰 비율 옵션 (`--lang ko`).
 - 각 셀 최소 `request_count = concurrency × 5` 또는 60초 중 긴 쪽.
 - `nvidia-smi --query-gpu` 1초 샘플링을 백그라운드로.
@@ -270,3 +286,11 @@ ROADMAP.md 를 읽어. 지금 W1 이다.
 4. 1.1 스키마를 cli/prembench/schema.py 에 pydantic v2 로 구현해.
 끝나면 `prembench --help` 가 뜨는지 확인해.
 ```
+
+> **메모 — 사이트 표시 정책**
+> 운영자 기본 뷰에서는 다음 필드를 숨기고, "전체 필드 보기" 토글로 노출한다.
+> - `gpu_util_avg_pct`
+> - 에너지 3종: `power_avg_w`, `energy_total_j`, `energy_per_output_token_j`
+> - `pcie_gen`, `pcie_lanes`, `numa_nodes`, `gpu_clock_locked`
+>
+> 숨기는 것이지 빼는 것이 아니다. 레코드·원본 JSON 에는 그대로 남는다.

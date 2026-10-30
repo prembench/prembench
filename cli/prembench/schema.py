@@ -3,10 +3,13 @@
 규칙:
 - 모든 키는 필수(레코드에 반드시 존재). 실측하지 못한 값은 생략이 아니라 null.
 - 추정·보간 값은 넣지 않는다.
+- 거부까지는 아니지만 사이트에서 구분 표시할 레코드는 SchemaWarning 으로 경고한다.
 """
 
 from __future__ import annotations
 
+import warnings
+from collections import Counter
 from datetime import datetime
 from typing import Literal
 
@@ -21,6 +24,12 @@ EngineName = Literal["vllm", "sglang", "ollama", "tgi"]
 LoadMode = Literal["closed_loop", "open_loop"]
 ArrivalProcess = Literal["poisson", "constant"]
 TokenCountSource = Literal["engine_usage", "client_tokenizer"]
+FinishReason = Literal["stop", "length", "error", "other"]
+ModelLoadState = Literal["cold", "warm"]
+
+
+class SchemaWarning(UserWarning):
+    """유효한 레코드지만 사이트에서 구분 표시가 필요한 경우."""
 
 
 class _Strict(BaseModel):
@@ -94,6 +103,14 @@ class Engine(_Strict):
     )
 
 
+class Sampling(_Strict):
+    temperature: float = Field(ge=0, description="샘플링 온도")
+    top_p: float = Field(gt=0, le=1, description="nucleus sampling 확률 질량 (0~1]")
+    repetition_penalty: float = Field(gt=0, description="반복 패널티. 1.0 이면 없음")
+    max_tokens: int = Field(ge=1, description="요청당 최대 출력 토큰, 단위 토큰")
+    stop: list[str] = Field(description="stop 문자열 목록. 없으면 빈 배열")
+
+
 class Load(_Strict):
     concurrency: int = Field(ge=1, description="동시 요청 수")
     input_tokens: int = Field(ge=1, description="요청당 입력 길이, 단위 토큰")
@@ -110,6 +127,11 @@ class Load(_Strict):
         description="open_loop 도착 간격 분포. closed_loop 면 null"
     )
     random_seed: int | None = Field(description="프롬프트·도착 간격 생성 난수 시드")
+    sampling: Sampling = Field(description="요청에 실어 보낸 샘플링 파라미터. 측정 시 반드시 기록")
+    reasoning_enabled: bool | None = Field(description="추론(thinking) 모드 켜짐 여부")
+    reasoning_budget_tokens: int | None = Field(
+        ge=0, description="추론 토큰 예산, 단위 토큰. 예산을 걸지 않았으면 null"
+    )
 
     @model_validator(mode="after")
     def _check_mode(self) -> Load:
@@ -118,6 +140,8 @@ class Load(_Strict):
             raise ValueError("mode='open_loop' 이면 arrival_rate_rps, arrival_process 가 필요함")
         if self.mode == "closed_loop" and open_fields != (None, None):
             raise ValueError("mode='closed_loop' 이면 arrival_rate_rps, arrival_process 는 null 이어야 함")
+        if self.reasoning_budget_tokens is not None and self.reasoning_enabled is not True:
+            raise ValueError("reasoning_budget_tokens 는 reasoning_enabled=true 일 때만 기록")
         return self
 
 
@@ -130,6 +154,23 @@ class PerRequest(_Strict):
         ge=0, description="(e2e - ttft) / (output_tokens - 1), 단위 ms. output_tokens < 2 면 null"
     )
     output_tokens: int | None = Field(ge=0, description="출력 토큰 수 (token_count_source 기준)")
+    finish_reason: FinishReason = Field(
+        description="종료 이유. 실패 요청은 'error', 엔진이 stop/length 외 값을 주면 'other'"
+    )
+    reasoning_tokens: int | None = Field(
+        ge=0, description="출력 토큰 중 추론 토큰 수. 엔진이 분리해 주지 않으면 null"
+    )
+
+
+class FinishReasonCounts(_Strict):
+    stop: int = Field(ge=0, description="자연 종료(EOS·stop 문자열) 요청 수")
+    length: int = Field(ge=0, description="max_tokens 도달로 끊긴 요청 수")
+    error: int = Field(ge=0, description="실패 요청 수")
+    other: int = Field(ge=0, description="그 밖의 종료 이유 요청 수")
+
+    @property
+    def total(self) -> int:
+        return self.stop + self.length + self.error + self.other
 
 
 class Result(_Strict):
@@ -167,6 +208,22 @@ class Result(_Strict):
     token_count_source: TokenCountSource | None = Field(
         description="출력 토큰 수 출처: 엔진 usage 보고 / 클라이언트 토크나이저 재계산. 둘 다 없으면 null"
     )
+    reasoning_tokens_mean: float | None = Field(
+        ge=0, description="요청당 추론 토큰 수 평균. 엔진이 분리해 주지 않으면 null"
+    )
+    content_tokens_mean: float | None = Field(
+        ge=0, description="요청당 본문(추론 제외) 토큰 수 평균. 엔진이 분리해 주지 않으면 null"
+    )
+    finish_reason_counts: FinishReasonCounts = Field(
+        description="측정 구간 요청의 종료 이유별 개수. 합 = request_count"
+    )
+    content_empty_rate: float = Field(
+        ge=0, le=1,
+        description="성공했지만 본문이 빈 요청 수 / request_count (추론만 하고 끝난 경우 등)",
+    )
+    prefix_cache_hit_rate: float | None = Field(
+        ge=0, le=1, description="엔진 메트릭의 prefix 캐시 적중률 (0~1). 엔진이 안 주면 null"
+    )
     per_request: list[PerRequest] = Field(description="측정 구간 요청별 원시값, 요청 순서대로")
 
     @model_validator(mode="after")
@@ -180,6 +237,25 @@ class Result(_Strict):
             if vals != sorted(vals):
                 raise ValueError(f"{name} 백분위가 단조 증가하지 않음: {seq}")
         return self
+
+
+class Conditions(_Strict):
+    """측정 당시 조건. 같은 하드웨어·설정이라도 결과를 바꾸는 것들."""
+
+    model_load_state: ModelLoadState = Field(
+        description="측정 직전 모델 상태. cold: 엔진 기동 직후 첫 측정 / warm: 이미 요청을 처리한 엔진"
+    )
+    colocated_workloads: bool | None = Field(
+        description="측정 중 같은 GPU 에 다른 프로세스가 있었는지. 확인 못 했으면 null"
+    )
+    shared_tenancy_note: str | None = Field(description="자원 공유 상황 메모 (자유 서술)")
+    gpu_temp_start_c: float | None = Field(
+        description="측정 구간 시작 시 GPU 온도, 단위 °C (nvidia-smi, 여러 장이면 최댓값)"
+    )
+    gpu_temp_end_c: float | None = Field(
+        description="측정 구간 종료 시 GPU 온도, 단위 °C (nvidia-smi, 여러 장이면 최댓값)"
+    )
+    chat_template_variant: str | None = Field(description="적용한 chat template 이름 또는 해시")
 
 
 class Run(_Strict):
@@ -198,6 +274,7 @@ class Run(_Strict):
     model: Model
     engine: Engine
     load: Load
+    conditions: Conditions
     result: Result
 
     @model_validator(mode="after")
@@ -222,6 +299,27 @@ class Run(_Strict):
             or any(r.output_tokens is not None for r in self.result.per_request)
         ):
             raise ValueError("token_count_source 가 null 이면 출력 토큰 수도 null 이어야 함")
+
+        frc = self.result.finish_reason_counts
+        if frc.total != self.load.request_count:
+            raise ValueError(
+                f"finish_reason_counts 합({frc.total}) != request_count({self.load.request_count})"
+            )
+        tally = Counter(r.finish_reason for r in self.result.per_request)
+        if tally != Counter({k: v for k, v in frc.model_dump().items() if v}):
+            raise ValueError(f"finish_reason_counts 가 per_request 집계와 다름: {dict(tally)}")
+        if frc.error != self.result.error_count:
+            raise ValueError(
+                f"finish_reason_counts.error({frc.error}) != error_count({self.result.error_count})"
+            )
+
+        if self.load.reasoning_enabled and self.result.reasoning_tokens_mean is None:
+            warnings.warn(
+                f"run {self.run_id}: reasoning_enabled=true 인데 reasoning_tokens_mean 이 null "
+                "— 추론/본문 토큰 미분리 레코드로 표시",
+                SchemaWarning,
+                stacklevel=2,
+            )
         return self
 
 

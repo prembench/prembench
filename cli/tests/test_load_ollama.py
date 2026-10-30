@@ -8,6 +8,7 @@ import os
 import pytest
 
 from prembench.load import run_load
+from prembench.schema import Sampling
 
 URL = os.environ.get("PREMBENCH_OLLAMA_URL")
 MODEL = os.environ.get("PREMBENCH_OLLAMA_MODEL", "qwen2.5:1.5b")
@@ -18,8 +19,10 @@ pytestmark = pytest.mark.skipif(not URL, reason="PREMBENCH_OLLAMA_URL 미설정"
 async def test_ollama_streaming_one_cell():
     run = await run_load(
         URL, MODEL, ["Count from 1 to 100 separated by spaces."],
-        concurrency=2, request_count=4, warmup_count=1, max_tokens=32,
+        sampling=Sampling(temperature=0.0, top_p=1.0, repetition_penalty=1.0, max_tokens=32, stop=[]),
+        concurrency=2, request_count=4, warmup_count=1,
     )
+    assert run.ready.ok
     assert run.error_count == 0, [r.error for r in run.records]
     for r in run.records:
         assert r.ttft_s is not None and r.ttft_s > 0
@@ -27,3 +30,6 @@ async def test_ollama_streaming_one_cell():
         assert all(x >= 0 for x in r.itl_s)
         # Ollama 는 stream_options.include_usage 를 지원한다
         assert r.completion_tokens is not None and 0 < r.completion_tokens <= 32
+        assert r.finish_reason in ("stop", "length")
+    # 맥북엔 nvidia-smi 가 없으므로 null
+    assert run.gpu_temp_start_c is None

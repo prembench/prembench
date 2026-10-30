@@ -1,17 +1,20 @@
 import copy
+import warnings
 
 import pytest
 from pydantic import ValidationError
 
-from prembench.schema import Run, json_schema
+from prembench.schema import Run, SchemaWarning, json_schema
 
 # 전부 가상 값
 
 
 def _record() -> dict:
     per_request = [
-        {"ttft_ms": 120.0, "e2e_ms": 2600.0, "tpot_ms": 19.5, "output_tokens": 128},
-        {"ttft_ms": None, "e2e_ms": 30.0, "tpot_ms": None, "output_tokens": None},  # 실패 요청
+        {"ttft_ms": 120.0, "e2e_ms": 2600.0, "tpot_ms": 19.5, "output_tokens": 128,
+         "finish_reason": "length", "reasoning_tokens": None},
+        {"ttft_ms": None, "e2e_ms": 30.0, "tpot_ms": None, "output_tokens": None,
+         "finish_reason": "error", "reasoning_tokens": None},  # 실패 요청
     ]
     return {
         "run_id": "example-0001",
@@ -43,6 +46,13 @@ def _record() -> dict:
             "concurrency": 1, "input_tokens": 512, "output_tokens": 128, "request_count": 2,
             "warmup_count": 1, "mode": "closed_loop", "arrival_rate_rps": None,
             "arrival_process": None, "random_seed": 0,
+            "sampling": {"temperature": 0.0, "top_p": 1.0, "repetition_penalty": 1.0,
+                         "max_tokens": 128, "stop": []},
+            "reasoning_enabled": False, "reasoning_budget_tokens": None,
+        },
+        "conditions": {
+            "model_load_state": "warm", "colocated_workloads": False, "shared_tenancy_note": None,
+            "gpu_temp_start_c": 41.0, "gpu_temp_end_c": 63.0, "chat_template_variant": None,
         },
         "result": {
             "ttft_p50_ms": 120.0, "ttft_p95_ms": 120.0, "ttft_p99_ms": 120.0,
@@ -53,23 +63,34 @@ def _record() -> dict:
             "gpu_mem_peak_gb": None, "gpu_util_avg_pct": None, "power_avg_w": None,
             "duration_s": 2.63, "energy_total_j": None, "energy_per_output_token_j": None,
             "output_tokens_actual_mean": 128.0, "token_count_source": "engine_usage",
+            "reasoning_tokens_mean": None, "content_tokens_mean": None,
+            "finish_reason_counts": {"stop": 0, "length": 1, "error": 1, "other": 0},
+            "content_empty_rate": 0.0, "prefix_cache_hit_rate": None,
             "per_request": per_request,
         },
     }
 
 
-def _with(path: str, value) -> dict:
-    rec = copy.deepcopy(_record())
+def _locate(rec: dict, path: str):
+    """'a.b.0.c' → (부모 노드, 마지막 키). 숫자 조각은 리스트 인덱스."""
     *parents, last = path.split(".")
     node = rec
     for p in parents:
-        node = node[p]
+        node = node[int(p)] if isinstance(node, list) else node[p]
+    return node, last
+
+
+def _with(path: str, value) -> dict:
+    rec = copy.deepcopy(_record())
+    node, last = _locate(rec, path)
     node[last] = value
     return rec
 
 
 def test_valid_record():
-    run = Run.model_validate(_record())
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # 정상 레코드는 경고도 없어야 한다
+        run = Run.model_validate(_record())
     assert run.result.per_request[1].ttft_ms is None
 
 
@@ -83,14 +104,21 @@ def test_valid_record():
         "result.per_request",
         "result.token_count_source",
         "result.itl_p99_ms",
+        "load.sampling",
+        "load.sampling.stop",
+        "load.reasoning_enabled",
+        "conditions",
+        "conditions.model_load_state",
+        "result.finish_reason_counts",
+        "result.content_empty_rate",
+        "result.prefix_cache_hit_rate",
+        "result.per_request.0.finish_reason",
+        "result.per_request.0.reasoning_tokens",
     ],
 )
 def test_new_fields_are_required_keys(path):
     rec = copy.deepcopy(_record())
-    *parents, last = path.split(".")
-    node = rec
-    for p in parents:
-        node = node[p]
+    node, last = _locate(rec, path)
     del node[last]
     with pytest.raises(ValidationError):
         Run.model_validate(rec)
@@ -140,3 +168,60 @@ def test_json_schema_has_new_fields():
     assert "PerRequest" in s["$defs"]
     assert {"mode", "arrival_rate_rps", "arrival_process", "random_seed"} <= set(s["$defs"]["Load"]["required"])
     assert "per_request" in s["$defs"]["Result"]["required"]
+    assert "conditions" in s["required"]
+    assert {"Sampling", "Conditions", "FinishReasonCounts"} <= set(s["$defs"])
+
+
+def test_sampling_not_nullable():
+    with pytest.raises(ValidationError):
+        Run.model_validate(_with("load.sampling", None))
+    with pytest.raises(ValidationError):
+        Run.model_validate(_with("load.sampling.temperature", None))
+
+
+def test_finish_reason_counts_must_sum_to_request_count():
+    rec = _with("result.finish_reason_counts", {"stop": 1, "length": 1, "error": 1, "other": 0})
+    with pytest.raises(ValidationError, match="finish_reason_counts 합"):
+        Run.model_validate(rec)
+
+
+def test_finish_reason_counts_must_match_per_request():
+    rec = _with("result.finish_reason_counts", {"stop": 1, "length": 0, "error": 1, "other": 0})
+    with pytest.raises(ValidationError, match="per_request 집계"):
+        Run.model_validate(rec)
+
+
+def test_finish_reason_error_matches_error_count():
+    with pytest.raises(ValidationError, match="error_count"):
+        Run.model_validate(_with("result.error_count", 0))
+
+
+def test_content_empty_rate_range():
+    with pytest.raises(ValidationError):
+        Run.model_validate(_with("result.content_empty_rate", 1.5))
+
+
+def test_reasoning_enabled_without_split_warns_not_rejects():
+    rec = _with("load.reasoning_enabled", True)
+    with pytest.warns(SchemaWarning, match="reasoning_tokens_mean"):
+        run = Run.model_validate(rec)
+    assert run.load.reasoning_enabled is True
+
+
+def test_reasoning_enabled_with_split_no_warning():
+    rec = _with("load.reasoning_enabled", True)
+    rec["result"]["reasoning_tokens_mean"] = 40.0
+    rec["result"]["content_tokens_mean"] = 88.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Run.model_validate(rec)
+
+
+def test_reasoning_budget_requires_reasoning_enabled():
+    with pytest.raises(ValidationError, match="reasoning_budget_tokens"):
+        Run.model_validate(_with("load.reasoning_budget_tokens", 1024))
+
+
+def test_conditions_model_load_state_enum():
+    with pytest.raises(ValidationError):
+        Run.model_validate(_with("conditions.model_load_state", "lukewarm"))

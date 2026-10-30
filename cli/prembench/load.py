@@ -1,11 +1,16 @@
 """비동기 부하 생성 — OpenAI-compatible `/v1/chat/completions` 스트리밍.
 
+절차:
+1. 준비 확인: 실제 생성 요청 1건이 토큰을 돌려줘야 한다. `/v1/models` 200 은 준비로 치지 않는다
+   (모델 적재 중에도 200 을 주는 엔진이 있다). 실패하면 NotReadyError — 측정을 시작하지 않는다.
+2. 워밍업: 같은 동시성으로 돌리고 결과는 따로 둔다.
+3. 측정: 시작·종료 시 GPU 온도(nvidia-smi)를 기록한다. 없으면 None.
+
 - 고정 동시성(closed loop): 워커 `concurrency` 개가 요청이 끝나는 즉시 다음 요청을 보낸다.
-- 워밍업 요청을 먼저 같은 동시성으로 돌리고, 끝난 뒤 측정 구간을 시작한다.
-- 요청마다 '내용이 있는 청크'의 도착 시각을 요청 시작 기준으로 기록한다.
+- 요청마다 '출력이 있는 청크'의 도착 시각을 요청 시작 기준으로 기록한다.
   청크 1개 = 토큰 1개라는 보장은 없다(엔진에 따라 여러 토큰이 한 청크로 옴).
-  출력 토큰 수는 엔진이 보고한 usage.completion_tokens 만 쓰고, 없으면 None. 청크 수로 추정하지 않는다.
-- 실패는 예외로 던지지 않고 레코드에 남긴다 (OOM 셀도 기록해야 하므로).
+  출력 토큰 수는 엔진이 보고한 usage 만 쓰고, 없으면 None. 청크 수로 추정하지 않는다.
+- 실패는 예외로 던지지 않고 레코드에 남긴다 (OOM 셀도 기록해야 하므로). 준비 확인만 예외.
 
 백분위·tps 계산은 metrics.py 몫. 여기서는 원시 시각만 남긴다.
 """
@@ -16,17 +21,25 @@ import asyncio
 import itertools
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import httpx
+
+from prembench.probe import gpu_temperature_c
+from prembench.schema import FinishReason, Sampling
 
 _CONNECT_TIMEOUT_S = 10
 # 긴 컨텍스트 + 높은 동시성에서는 첫 토큰까지 수 분이 걸릴 수 있다
 _DEFAULT_TIMEOUT_S = 600
 _ERROR_BODY_MAX = 500
-# 스트림 델타에서 출력으로 치는 필드. reasoning 계열은 gpt-oss 등 추론 모델용
-_CONTENT_KEYS = ("content", "reasoning_content", "reasoning")
+_READY_MAX_TOKENS = 4
+# 추론 출력 델타 필드. gpt-oss·Qwen3 등 (엔진마다 이름이 다름)
+_REASONING_KEYS = ("reasoning_content", "reasoning")
+
+
+class NotReadyError(RuntimeError):
+    """준비 확인 요청이 토큰을 돌려주지 못함. 측정을 시작하지 않는다."""
 
 
 @dataclass
@@ -37,8 +50,11 @@ class RequestRecord:
     end_s: float  # 부하 시작 기준 응답 종료 시각, 단위 초
     status: int | None  # HTTP 상태. 연결 실패 등으로 응답이 없으면 None
     error: str | None
-    chunk_times_s: list[float] = field(default_factory=list)  # 요청 시작 기준 내용 청크 도착 시각
+    chunk_times_s: list[float] = field(default_factory=list)  # 요청 시작 기준 출력 청크 도착 시각 (추론 포함)
+    content_chunks: int = 0  # 본문(추론 제외) 출력이 있었던 청크 수
+    finish_reason_raw: str | None = None  # 엔진이 보낸 원문
     completion_tokens: int | None = None  # 엔진 보고 usage. 없으면 None
+    reasoning_tokens: int | None = None  # usage.completion_tokens_details.reasoning_tokens. 없으면 None
     prompt_tokens: int | None = None
 
     @property
@@ -51,21 +67,36 @@ class RequestRecord:
 
     @property
     def itl_s(self) -> list[float]:
-        """연속한 내용 청크 사이 간격, 단위 초."""
-        t = self.chunk_times_s
-        return [b - a for a, b in itertools.pairwise(t)]
+        """연속한 출력 청크 사이 간격, 단위 초."""
+        return [b - a for a, b in itertools.pairwise(self.chunk_times_s)]
 
     @property
     def e2e_s(self) -> float:
         return self.end_s - self.start_s
 
+    @property
+    def content_empty(self) -> bool:
+        """성공했는데 본문이 비었는가 (추론만 하고 끝난 경우 등)."""
+        return self.ok and self.content_chunks == 0
+
+    @property
+    def finish_reason(self) -> FinishReason:
+        if not self.ok:
+            return "error"
+        if self.finish_reason_raw in ("stop", "length"):
+            return self.finish_reason_raw
+        return "other"
+
 
 @dataclass
 class LoadRun:
+    ready: RequestRecord  # 준비 확인 요청
     records: list[RequestRecord]  # 측정 구간 (워밍업 제외)
     warmup_records: list[RequestRecord]
     measure_start_s: float  # 부하 시작 기준
     measure_end_s: float
+    gpu_temp_start_c: float | None
+    gpu_temp_end_c: float | None
 
     @property
     def duration_s(self) -> float:
@@ -90,6 +121,8 @@ async def _one_request(
 ) -> RequestRecord:
     start = time.perf_counter()
     chunk_times: list[float] = []
+    content_chunks = 0
+    finish_reason: str | None = None
     usage: dict | None = None
     status: int | None = None
     error: str | None = None
@@ -119,15 +152,19 @@ async def _one_request(
                         usage = chunk["usage"]
                     for choice in chunk.get("choices") or []:
                         delta = choice.get("delta") or {}
-                        if any(delta.get(k) for k in _CONTENT_KEYS):
+                        has_content = bool(delta.get("content"))
+                        if has_content or any(delta.get(k) for k in _REASONING_KEYS):
                             chunk_times.append(now - start)
-                            break
+                            content_chunks += has_content
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
     except httpx.HTTPError as e:
         error = f"{type(e).__name__}: {e}"[:_ERROR_BODY_MAX]
     end = time.perf_counter()
 
     if error is None and not chunk_times:
         error = "no output tokens in stream"
+    usage = usage or {}
     return RequestRecord(
         index=index,
         warmup=warmup,
@@ -136,8 +173,11 @@ async def _one_request(
         status=status,
         error=error,
         chunk_times_s=chunk_times,
-        completion_tokens=(usage or {}).get("completion_tokens"),
-        prompt_tokens=(usage or {}).get("prompt_tokens"),
+        content_chunks=content_chunks,
+        finish_reason_raw=finish_reason,
+        completion_tokens=usage.get("completion_tokens"),
+        reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+        prompt_tokens=usage.get("prompt_tokens"),
     )
 
 
@@ -162,20 +202,38 @@ async def _phase(
     return out
 
 
+def request_body(model: str, prompt: str, sampling: Sampling, extra_body: dict | None = None) -> dict:
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": sampling.temperature,
+        "top_p": sampling.top_p,
+        "repetition_penalty": sampling.repetition_penalty,
+        "max_tokens": sampling.max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    # 빈 stop 배열을 거부하는 서버가 있어 비었으면 보내지 않는다
+    if sampling.stop:
+        body["stop"] = list(sampling.stop)
+    return {**body, **(extra_body or {})}
+
+
 async def run_load(
     base_url: str,
     model: str,
     prompts: Sequence[str],
     *,
+    sampling: Sampling,
     concurrency: int,
     request_count: int,
-    max_tokens: int,
     warmup_count: int = 0,
     extra_body: dict | None = None,
     timeout_s: float = _DEFAULT_TIMEOUT_S,
     headers: dict[str, str] | None = None,
+    gpu_temp: Callable[[], float | None] = gpu_temperature_c,
 ) -> LoadRun:
-    """`prompts` 를 순환하며 워밍업 `warmup_count` 개 → 측정 `request_count` 개를 보낸다.
+    """준비 확인 1건 → 워밍업 `warmup_count` 개 → 측정 `request_count` 개. `prompts` 는 순환해서 쓴다.
 
     base_url 은 `/v1` 까지 포함. 예: http://localhost:11434/v1
     extra_body 는 엔진별 옵션 (예: vLLM 의 {"ignore_eos": True, "min_tokens": N}).
@@ -186,23 +244,22 @@ async def run_load(
         raise ValueError("prompts 가 비어 있음")
 
     def body(i: int) -> dict:
-        return {
-            "model": model,
-            "messages": [{"role": "user", "content": prompts[i % len(prompts)]}],
-            "max_tokens": max_tokens,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-            **(extra_body or {}),
-        }
+        return request_body(model, prompts[i % len(prompts)], sampling, extra_body)
 
     url = _chat_url(base_url)
     limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
     timeout = httpx.Timeout(timeout_s, connect=_CONNECT_TIMEOUT_S)
     async with httpx.AsyncClient(limits=limits, timeout=timeout, headers=headers) as client:
         t0 = time.perf_counter()
+        ready_body = {**body(0), "max_tokens": min(sampling.max_tokens, _READY_MAX_TOKENS)}
+        ready = await _one_request(client, url, ready_body, -1, True, t0)
+        if not ready.ok:
+            raise NotReadyError(f"준비 확인 실패, 측정 시작 안 함: {ready.error}")
+
         warm = await _phase(
             client, url, [body(i) for i in range(warmup_count)], concurrency, True, t0
         )
+        temp_start = await asyncio.to_thread(gpu_temp)
         measure_start = time.perf_counter() - t0
         measured = await _phase(
             client,
@@ -213,4 +270,5 @@ async def run_load(
             t0,
         )
         measure_end = time.perf_counter() - t0
-    return LoadRun(measured, warm, measure_start, measure_end)
+        temp_end = await asyncio.to_thread(gpu_temp)
+    return LoadRun(ready, measured, warm, measure_start, measure_end, temp_start, temp_end)
