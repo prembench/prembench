@@ -11,6 +11,7 @@ import json
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import uvicorn
@@ -26,6 +27,8 @@ class MockConfig:
     reasoning_tokens: int = 0  # 본문 앞에 reasoning_content 로 보낼 토큰 수
     fail_requests: frozenset[int] = frozenset()  # 500 을 돌려줄 요청 번호 (1부터, 준비 확인 포함)
     send_usage: bool = True
+    # 본문 문자열 → usage.prompt_tokens. 엔진의 토크나이저 + chat template 역할
+    prompt_tokens: Callable[[str], int] = lambda content: 5
 
 
 @dataclass
@@ -52,6 +55,17 @@ def make_app(cfg: MockConfig, state: MockState) -> FastAPI:
         n_content = min(cfg.tokens, limit - n_reason)
         n = n_reason + n_content
         finish = "length" if cfg.reasoning_tokens + cfg.tokens > limit else "stop"
+        p_tok = cfg.prompt_tokens(body["messages"][-1]["content"])
+
+        if not body.get("stream"):
+            resp = {
+                "id": "mock-1", "object": "chat.completion", "model": body["model"],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "t0"},
+                             "finish_reason": finish}],
+            }
+            if cfg.send_usage:
+                resp["usage"] = {"prompt_tokens": p_tok, "completion_tokens": n, "total_tokens": p_tok + n}
+            return JSONResponse(resp)
 
         async def gen():
             state.in_flight += 1
@@ -69,7 +83,7 @@ def make_app(cfg: MockConfig, state: MockState) -> FastAPI:
                     yield f"data: {json.dumps(chunk)}\n\n"
                 yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}]})}\n\n"
                 if cfg.send_usage and (body.get("stream_options") or {}).get("include_usage"):
-                    usage = {"prompt_tokens": 5, "completion_tokens": n, "total_tokens": 5 + n}
+                    usage = {"prompt_tokens": p_tok, "completion_tokens": n, "total_tokens": p_tok + n}
                     if cfg.reasoning_tokens:
                         usage["completion_tokens_details"] = {"reasoning_tokens": n_reason}
                     yield f"data: {json.dumps({**base, 'choices': [], 'usage': usage})}\n\n"

@@ -113,7 +113,9 @@ class Sampling(_Strict):
 
 class Load(_Strict):
     concurrency: int = Field(ge=1, description="동시 요청 수")
-    input_tokens: int = Field(ge=1, description="요청당 입력 길이, 단위 토큰")
+    input_tokens: int = Field(
+        ge=1, description="요청당 입력 길이, 단위 토큰. 엔진이 본 전체 프롬프트(chat template 포함) = usage.prompt_tokens"
+    )
     output_tokens: int = Field(ge=1, description="요청당 출력 길이, 단위 토큰")
     request_count: int = Field(ge=1, description="측정 구간의 총 요청 수 (워밍업 제외)")
     warmup_count: int = Field(ge=0, description="측정 전 버린 워밍업 요청 수")

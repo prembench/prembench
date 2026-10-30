@@ -45,8 +45,10 @@ prembench --help
 prembench probe                  # 맥북에서는 "no GPU — NVIDIA GPU 미검출 (nvidia-smi 없음)"
 ```
 
-`dev` 엑스트라는 pytest, pytest-asyncio, 그리고 `load.py` 테스트용 mock 서버(fastapi, uvicorn)다.
-런타임 의존성은 typer, httpx, pydantic, rich 뿐이다.
+`dev` 엑스트라는 pytest, pytest-asyncio, `load.py` 테스트용 mock 서버(fastapi, uvicorn),
+그리고 `tokenizer` 엑스트라(HF `tokenizers`, 프롬프트 토큰 수 맞추기용)다.
+런타임 기본 의존성은 typer, httpx, pydantic, rich 뿐이다.
+토크나이저 파일은 첫 사용 시 HF 에서 받아 `~/.cache/prembench/tokenizers/` 에 캐시한다 (gated 모델은 `HF_TOKEN`).
 
 테스트:
 
@@ -69,7 +71,7 @@ curl -s http://localhost:11434/v1/models
 prembench probe --url http://localhost:11434/v1     # engine: ollama <버전>
 ```
 
-`load.py` 를 실제 Ollama 에 대고 도는 통합 테스트 (환경변수가 없으면 skip):
+`load.py`·`prompts.py` 를 실제 Ollama 에 대고 도는 통합 테스트 (환경변수가 없으면 skip, 첫 실행 시 Qwen 토크나이저를 HF 에서 받음):
 
 ```sh
 cd cli && PREMBENCH_OLLAMA_URL=http://localhost:11434/v1 pytest -q tests/test_load_ollama.py

@@ -52,6 +52,7 @@ engine:
 
 load:
   concurrency, input_tokens, output_tokens, request_count, warmup_count,
+  # input_tokens = 엔진이 본 전체 프롬프트 토큰 (chat template 포함) = usage.prompt_tokens
   mode (closed_loop|open_loop), arrival_rate_rps, arrival_process (poisson|constant),
   random_seed,
   sampling: {temperature, top_p, repetition_penalty, max_tokens, stop: [str]}   # null 불가, 측정 시 반드시 기록
@@ -111,6 +112,8 @@ result:
 - 워밍업 요청 N개 후 측정 시작.
 - 측정 구간 시작·종료 시 `nvidia-smi` 로 GPU 온도 기록 (없으면 null).
 - 입력 프롬프트는 고정 시드 랜덤 토큰 (캐시 효과 제거). 한국어 토큰 비율 옵션 (`--lang ko`).
+  - 모델 HF 토크나이저로 본문을 정확히 N 토큰으로 만들고, chat template 오버헤드는 엔진 usage.prompt_tokens 로 실측
+    (길이 2개로 재서 다르면 토크나이저 불일치 → 측정 중단). 본문 = input_tokens − 오버헤드.
 - 각 셀 최소 `request_count = concurrency × 5` 또는 60초 중 긴 쪽.
 - `nvidia-smi --query-gpu` 1초 샘플링을 백그라운드로.
 - 같은 셀 2회 반복, 편차 10% 넘으면 3회째 돌리고 중앙값.
@@ -129,6 +132,7 @@ prembench/                      # 확정 (2026-10-30)
 │       ├── __main__.py        # typer 앱
 │       ├── probe.py           # 하드웨어·엔진 자동 감지
 │       ├── load.py            # async 부하 생성
+│       ├── prompts.py         # 고정 시드 랜덤 프롬프트 (정확한 토큰 수)
 │       ├── metrics.py         # p50/p95 계산
 │       ├── schema.py          # pydantic 모델 (1.1)
 │       ├── grid.py            # 격자 실행
@@ -160,6 +164,7 @@ prembench/                      # 확정 (2026-10-30)
 - 측정 스키마는 ROADMAP.md 1.1 과 cli/prembench/schema.py 가 일치해야 한다. 바꾸면 둘 다.
 - 회사 코드·데이터·서버 이름을 절대 넣지 않는다. 예시 값은 전부 가상.
 - CLI 는 외부 의존성을 최소화한다 (typer, httpx, pydantic, rich 만).
+  예외: 선택 extra `prembench[tokenizer]` 의 `tokenizers` (프롬프트 토큰 수 맞추기). 기본 설치에는 넣지 않는다.
 - 모든 수치는 "실측"만. 추정·보간·외삽 금지. 값이 없으면 null.
 - 커밋 메시지는 영어, 코드 주석은 한국어 가능.
 - 테스트: pytest. load.py 는 mock 서버(기본 FastAPI)로 테스트.

@@ -17,7 +17,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tokenizer = [
+    "tokenizers>=0.19",  # 프롬프트 토큰 수 맞추기. 기본 설치에는 넣지 않는다
+]
 dev = [
+    "prembench[tokenizer]",
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "fastapi>=0.110",  # load.py 테스트용 mock 서버
