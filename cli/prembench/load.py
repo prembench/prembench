@@ -4,7 +4,8 @@
 1. 준비 확인: 실제 생성 요청 1건이 토큰을 돌려줘야 한다. `/v1/models` 200 은 준비로 치지 않는다
    (모델 적재 중에도 200 을 주는 엔진이 있다). 실패하면 NotReadyError — 측정을 시작하지 않는다.
 2. 워밍업: 같은 동시성으로 돌리고 결과는 따로 둔다.
-3. 측정: 시작·종료 시 GPU 온도(nvidia-smi)를 기록한다. 없으면 None.
+3. 측정: 요청 request_count 개 이상 AND min_duration_s 초 이상. 프롬프트는 측정 전에 미리 만든다.
+   시작·종료 시 GPU 온도(nvidia-smi)를 기록한다. 없으면 None.
 
 - 고정 동시성(closed loop): 워커 `concurrency` 개가 요청이 끝나는 즉시 다음 요청을 보낸다.
 - 요청마다 '출력이 있는 청크'의 도착 시각을 요청 시작 기준으로 기록한다.
@@ -20,8 +21,9 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import math
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import httpx
@@ -34,6 +36,8 @@ _CONNECT_TIMEOUT_S = 10
 _DEFAULT_TIMEOUT_S = 600
 _ERROR_MAX_CHARS = 200  # schema.PerRequest.error 와 같은 한도
 _READY_MAX_TOKENS = 4
+_POOL_MARGIN = 2  # 최소 측정 시간용 프롬프트를 워밍업 속도 기준 몇 배 만들지
+_MAX_REQUESTS = 20_000  # 측정 1회 요청 상한 (메모리·생성 시간 보호)
 # 추론 출력 델타 필드. gpt-oss·Qwen3 등 (엔진마다 이름이 다름)
 _REASONING_KEYS = ("reasoning_content", "reasoning")
 
@@ -125,6 +129,7 @@ class LoadRun:
     gpu_temp_end_c: float | None
     ignore_eos: bool
     gpu_samples: list[GpuSample] | None = None  # 측정 구간 nvidia-smi 샘플. 샘플러가 없으면 None
+    pool_exhausted: bool = False  # 미리 만든 프롬프트가 떨어져 min_duration_s 전에 멈춤
 
     def per_request(self) -> list[PerRequest]:
         return [r.to_per_request(self.measure_start_s) for r in self.records]
@@ -222,14 +227,35 @@ async def _phase(
     concurrency: int,
     warmup: bool,
     t0: float,
+    min_count: int | None = None,
+    min_duration_s: float = 0.0,
 ) -> list[RequestRecord]:
-    queue = iter(enumerate(bodies))
+    """bodies 를 고정 동시성으로 보낸다.
+
+    min_count 가 있으면 '요청 min_count 개 이상 AND 경과 min_duration_s 이상' 이 되는 순간 새 요청을 멈춘다
+    (이미 보낸 요청은 끝까지 받는다). bodies 가 먼저 떨어지면 거기서 멈춘다 — 재사용하지 않는다.
+    """
     out: list[RequestRecord] = []
+    next_i = 0
+    phase_start = time.perf_counter()
+
+    def take() -> int | None:
+        nonlocal next_i
+        if next_i >= len(bodies):
+            return None
+        if (
+            min_count is not None
+            and next_i >= min_count
+            and time.perf_counter() - phase_start >= min_duration_s
+        ):
+            return None
+        i, next_i = next_i, next_i + 1
+        return i
 
     async def worker() -> None:
-        # 단일 이벤트 루프라 next() 는 원자적
-        for i, body in queue:
-            out.append(await _one_request(client, url, body, i, warmup, t0))
+        # 단일 이벤트 루프라 take() 는 원자적
+        while (i := take()) is not None:
+            out.append(await _one_request(client, url, bodies[i], i, warmup, t0))
 
     await asyncio.gather(*(worker() for _ in range(min(concurrency, len(bodies)))))
     out.sort(key=lambda r: r.index)
@@ -267,64 +293,73 @@ def request_body(
 async def run_load(
     base_url: str,
     model: str,
-    prompts: Sequence[str],
+    prompt: Callable[[int], str],
     *,
     sampling: Sampling,
     concurrency: int,
     request_count: int,
     warmup_count: int = 0,
+    min_duration_s: float = 0.0,
+    max_requests: int = _MAX_REQUESTS,
     extra_body: dict | None = None,
     ignore_eos: bool = False,
     timeout_s: float = _DEFAULT_TIMEOUT_S,
     headers: dict[str, str] | None = None,
     gpu_temp: Callable[[], float | None] = gpu_temperature_c,
     gpu_sampler: GpuSampler | None = None,
-    ready_prompt: str | None = None,
 ) -> LoadRun:
-    """준비 확인 1건 → 워밍업 `warmup_count` 개 → 측정 `request_count` 개. `prompts` 는 순환해서 쓴다.
+    """준비 확인 1건 → 워밍업 `warmup_count` 개 → 측정 (요청 `request_count` 개 이상 AND `min_duration_s` 초 이상).
+
+    prompt(i): i 번째 요청의 본문. -1 은 준비 확인용, 0.. 은 워밍업 다음 측정. 요청마다 달라야 prefix 캐시를 피한다.
+    프롬프트는 측정 중에 만들지 않는다 (생성이 이벤트 루프를 막아 토큰 도착 시각이 밀린다).
+    측정 분량은 워밍업이 끝난 뒤(요청이 하나도 없을 때) 워밍업 처리 속도로 min_duration_s 의
+    2배(_POOL_MARGIN)를 미리 만든다. 그래도 모자라면 반복 사용하지 않고 멈추고 LoadRun.pool_exhausted 로 알린다.
 
     base_url 은 `/v1` 까지 포함. 예: http://localhost:11434/v1
     extra_body 는 엔진별 옵션 (예: vLLM 의 {"min_tokens": N}).
-    ready_prompt: 준비 확인용 프롬프트. 측정 프롬프트와 겹치면 prefix 캐시가 첫 측정을 부풀리므로 따로 주는 게 좋다.
     """
-    if concurrency < 1 or request_count < 1 or warmup_count < 0:
-        raise ValueError("concurrency>=1, request_count>=1, warmup_count>=0")
-    if not prompts:
-        raise ValueError("prompts 가 비어 있음")
+    if concurrency < 1 or request_count < 1 or warmup_count < 0 or min_duration_s < 0:
+        raise ValueError("concurrency>=1, request_count>=1, warmup_count>=0, min_duration_s>=0")
 
-    def body(i: int) -> dict:
-        return request_body(model, prompts[i % len(prompts)], sampling, extra_body, ignore_eos)
+    def body(text: str) -> dict:
+        return request_body(model, text, sampling, extra_body, ignore_eos)
 
     url = _chat_url(base_url)
     limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
     timeout = httpx.Timeout(timeout_s, connect=_CONNECT_TIMEOUT_S)
     async with httpx.AsyncClient(limits=limits, timeout=timeout, headers=headers) as client:
         t0 = time.perf_counter()
-        ready_body = request_body(model, ready_prompt if ready_prompt is not None else prompts[0],
-                                  sampling, extra_body, ignore_eos)
+        ready_body = body(prompt(-1))
         ready_body["max_tokens"] = min(sampling.max_tokens, _READY_MAX_TOKENS)
         ready = await _one_request(client, url, ready_body, -1, True, t0)
         if not ready.ok:
             raise NotReadyError(f"준비 확인 실패, 측정 시작 안 함: {ready.error}")
 
+        warm_start = time.perf_counter()
         warm = await _phase(
-            client, url, [body(i) for i in range(warmup_count)], concurrency, True, t0
+            client, url, [body(prompt(i)) for i in range(warmup_count)], concurrency, True, t0
         )
+        warm_s = time.perf_counter() - warm_start
+
+        # 측정 분량 미리 생성 (진행 중인 요청 없음)
+        pool = request_count
+        if min_duration_s > 0 and warm and warm_s > 0:
+            pool = max(pool, math.ceil(len(warm) / warm_s * min_duration_s * _POOL_MARGIN) + concurrency)
+        pool = max(request_count, min(pool, max_requests))
+        bodies = [body(prompt(warmup_count + i)) for i in range(pool)]
+
         temp_start = await asyncio.to_thread(gpu_temp)
         if gpu_sampler is not None:
             gpu_sampler.start()
         measure_start = time.perf_counter() - t0
         measured = await _phase(
-            client,
-            url,
-            [body(warmup_count + i) for i in range(request_count)],
-            concurrency,
-            False,
-            t0,
+            client, url, bodies, concurrency, False, t0, min_count=request_count, min_duration_s=min_duration_s
         )
         measure_end = time.perf_counter() - t0
         samples = await asyncio.to_thread(gpu_sampler.stop) if gpu_sampler is not None else None
         temp_end = await asyncio.to_thread(gpu_temp)
+    exhausted = len(measured) == len(bodies) and (measure_end - measure_start) < min_duration_s
     return LoadRun(
-        ready, measured, warm, measure_start, measure_end, temp_start, temp_end, ignore_eos, samples
+        ready, measured, warm, measure_start, measure_end, temp_start, temp_end, ignore_eos, samples,
+        pool_exhausted=exhausted,
     )

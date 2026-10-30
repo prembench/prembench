@@ -63,6 +63,7 @@ def _record() -> dict:
             "measured_from": "same_host", "model_load_state": "warm", "colocated_workloads": False, "shared_tenancy_note": None,
             "gpu_temp_start_c": 41.0, "gpu_temp_end_c": 63.0, "chat_template_variant": None,
         },
+        "repetition": {"index": 1, "count": 2, "representative": True},
         "result": {
             "ttft_p50_ms": 120.0, "ttft_p95_ms": 120.0, "ttft_p99_ms": 120.0,
             "tpot_p50_ms": 19.5, "tpot_p95_ms": 19.5,
@@ -350,3 +351,12 @@ def test_warn_prefix_cache_hit_rate():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         Run.model_validate(_with("result.prefix_cache_hit_rate", 0.05))
+
+
+def test_repetition_required_and_index_le_count():
+    rec = copy.deepcopy(_record())
+    del rec["repetition"]
+    with pytest.raises(ValidationError):
+        Run.model_validate(rec)
+    with pytest.raises(ValidationError, match="repetition.index"):
+        Run.model_validate(_with("repetition.index", 3))

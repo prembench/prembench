@@ -16,7 +16,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 _ERROR_MAX_CHARS = 200
 _PREFIX_CACHE_WARN = 0.05
 
@@ -315,6 +315,23 @@ class Conditions(_Strict):
     chat_template_variant: str | None = Field(description="적용한 chat template 이름 또는 해시")
 
 
+class Repetition(_Strict):
+    """같은 셀(같은 batch_id·하드웨어·모델·엔진·부하)의 반복 측정 중 이 레코드의 위치."""
+
+    index: int = Field(ge=1, description="몇 번째 회차인지 (1부터)")
+    count: int = Field(ge=1, description="이 셀을 몇 회 측정했는지")
+    representative: bool = Field(
+        description="셀 대표 회차인지. output_tps_total 의 nearest-rank 중앙값에 해당하는 실제 회차 "
+        "(3회면 가운데, 2회면 낮은 쪽). 사이트 표에는 대표 회차만 쓴다"
+    )
+
+    @model_validator(mode="after")
+    def _check_index(self) -> Repetition:
+        if self.index > self.count:
+            raise ValueError(f"repetition.index({self.index}) > count({self.count})")
+        return self
+
+
 class Run(_Strict):
     """측정 레코드 1건 = (하드웨어, 모델, 엔진, 부하) 격자 셀 1개의 실측 결과."""
 
@@ -340,6 +357,7 @@ class Run(_Strict):
     load: Load
     conditions: Conditions
     result: Result
+    repetition: Repetition
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Run:

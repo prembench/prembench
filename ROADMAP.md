@@ -23,10 +23,10 @@
 
 ## 1. 측정 설계 (스키마가 제품이다)
 
-### 1.1 레코드 필수 필드 (schema_version 1.0)
+### 1.1 레코드 필수 필드 (schema_version 1.1)
 
 ```
-schema_version ("1.0"), prembench_version, run_id, batch_id (격자 1회 실행 묶음|null),
+schema_version ("1.1"), prembench_version, run_id, batch_id (격자 1회 실행 묶음|null),
 submitted_at, submitter (handle), provenance ("self" | "community" | "scraped" | "vendor")
 environment ("cloud_rented" | "on_prem"), provider (자유 문자열 예: RunPod|Vast|Lambda, on_prem 이면 null)
   # 사이트의 모든 셀에 environment 를 표시한다. "온프레미스에서 쟀다"고 말하지 않는다.
@@ -93,6 +93,10 @@ result:
                  finish_reason, reasoning_tokens, content_empty (bool)}]
     # 측정 구간 요청 전부(실패 포함), 길이 = request_count, finish_reason 집계 = finish_reason_counts
 
+repetition: {index (1부터), count, representative (bool)}
+  # 같은 셀 반복 측정의 모든 회차를 레코드로 남긴다. 대표 = output_tps_total 의 nearest-rank 중앙값에
+  # 해당하는 실제 회차 (3회면 가운데, 2회면 낮은 쪽). 평균 내지 않는다. 사이트 표는 대표 회차만.
+
 # 모든 키는 필수. 재지 못한 값은 null (생략 아님). token_count_source 가 null 이면 토큰 수 필드도 null.
 # 경고(SchemaWarning, 거부 아님 — 사이트에서 구분 표시):
 #   - reasoning_enabled=true 인데 reasoning_tokens_mean=null ("추론 토큰 미분리")
@@ -136,6 +140,11 @@ result:
 - 각 셀 최소 `request_count = concurrency × 5` 또는 60초 중 긴 쪽.
 - `nvidia-smi --query-gpu` 1초 샘플링을 백그라운드로.
 - 같은 셀 2회 반복, 편차 10% 넘으면 3회째 돌리고 중앙값.
+  - 편차 = (max−min)/min, output_tps_total 과 ttft_p95_ms 둘 다 본다. 하나라도 10% 초과 또는 값 없음 → 3회째.
+  - 중앙값은 계산하지 않고 nearest-rank 중앙값에 해당하는 실제 회차를 대표로 표시 (repetition.representative).
+  - OOM 셀은 반복하지 않는다. 프롬프트 토큰 불일치 회차는 새 시드로 1번만 다시 잰다.
+  - 엔진이 죽으면 남은 셀은 재지 않는다 (레코드 없음). 입력+출력 > max_model_len 인 셀은 건너뛴다.
+- OOM 감지: 요청 오류 문구 + 엔진 로그(`--engine-log`, 회차 동안 새로 쓰인 줄만).
 
 ---
 
@@ -215,7 +224,7 @@ Claude Code 세션 프롬프트 예:
 - 완료 기준: `prembench run --url http://localhost:11434/v1 --model X --concurrency 4 --in 512 --out 128` 이 JSON 1개를 뱉음
 
 ### W3 (11/15~16) — 격자 + 자동화
-- [ ] `grid.py` — 1.2 격자 순회, OOM 감지(5xx + 엔진 로그), 반복·중앙값
+- [x] `grid.py` — 1.2 격자 순회, OOM 감지(5xx + 엔진 로그), 반복·중앙값
 - [ ] `runner/bootstrap.sh` — RunPod 템플릿: vllm 설치 → HF 캐시 볼륨 → `vllm serve` → 격자 → 결과 업로드 → `shutdown`
 - [ ] `matrix.yaml` 로 "이번 주말 조합" 선언
 - [ ] RunPod 계정, 네트워크 볼륨 생성, 4090 1시간 빌려서 7B 1개 격자 완주

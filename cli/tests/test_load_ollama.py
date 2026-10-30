@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(not URL, reason="PREMBENCH_OLLAMA_URL 미설정"
 
 async def test_ollama_streaming_one_cell():
     run = await run_load(
-        URL, MODEL, ["Count from 1 to 100 separated by spaces."],
+        URL, MODEL, lambda i: f"Count from {i + 2} to 100 separated by spaces.",
         sampling=Sampling(temperature=0.0, top_p=1.0, repetition_penalty=1.0, max_tokens=32, stop=[], seed=None),
         concurrency=2, request_count=4, warmup_count=1,
     )
@@ -46,9 +46,9 @@ async def test_ollama_exact_input_tokens():
     pools = token_pools(tok)
     overhead = await measure_template_overhead(URL, MODEL, tok, seed=0, pools=pools)
     for target, ko in [(512, 0.0), (512, 0.5)]:
-        prompts = build_prompts(tok, 2, content_tokens_for(target, overhead), seed=0, ko_ratio=ko, pools=pools)
+        prompts = build_prompts(tok, 3, content_tokens_for(target, overhead), seed=0, ko_ratio=ko, pools=pools)
         run = await run_load(
-            URL, MODEL, prompts,
+            URL, MODEL, lambda i: prompts[i + 1],
             sampling=Sampling(temperature=0.0, top_p=1.0, repetition_penalty=1.0, max_tokens=2, stop=[], seed=None),
             concurrency=1, request_count=2,
         )
@@ -70,7 +70,7 @@ def test_ollama_run_command_emits_valid_record(tmp_path, monkeypatch):
         "run", "--url", URL, "--model", MODEL, "--concurrency", "4", "--in", "512", "--out", "128",
         "--hf-id", os.environ.get("PREMBENCH_OLLAMA_HF_ID", "Qwen/Qwen2.5-1.5B-Instruct"),
         "--submitter", "example-user", "--provenance", "self", "--environment", "on_prem",
-        "--out-file", str(out),
+        "--out-file", str(out), "--min-duration", "0",
     ])
     assert res.exit_code == 0, res.output
     with warnings.catch_warnings():
