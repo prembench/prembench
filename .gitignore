@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# web/lib 는 Next.js 소스
+!web/lib/
