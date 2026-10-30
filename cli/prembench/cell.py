@@ -85,6 +85,7 @@ class Target:
     quantization: str | None = None
     weight_dtype: str | None = None
     model_load_state: str | None = None
+    server_command: str | None = None  # 엔진을 직접 띄웠을 때 그 명령 원문
 
 
 @dataclass(frozen=True)
@@ -322,7 +323,7 @@ class Session:
             name=engine_name, version=self.engine.version,
             tensor_parallel=tp, pipeline_parallel=pp, data_parallel=None, expert_parallel=None,
             max_model_len=self.max_model_len, gpu_memory_utilization=None, kv_cache_dtype=None,
-            enable_prefix_caching=None, server_command=None, extra_args=None,
+            enable_prefix_caching=None, server_command=t.server_command, extra_args=None,
             attention_backend=None, cuda_graphs=None, chunked_prefill=None,
             max_num_seqs=None, max_num_batched_tokens=None, speculative_decoding=None,
             engine_commit_or_image_digest=None,

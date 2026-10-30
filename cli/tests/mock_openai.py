@@ -33,6 +33,8 @@ class MockConfig:
     # Ollama 흉내용 (/v1/models, /api/*)
     models: tuple[str, ...] = ("mock",)
     ollama_version: str = "0.0.0-mock"
+    flavor: str = "ollama"  # "ollama" | "vllm" — /v1/models 의 owned_by·max_model_len, 버전 엔드포인트
+    max_model_len: int = 4096  # vllm flavor 에서 /v1/models 로 노출
 
 
 @dataclass
@@ -48,10 +50,23 @@ def make_app(cfg: MockConfig, state: MockState) -> FastAPI:
 
     @app.get("/v1/models")
     async def models():
-        return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "library"} for m in cfg.models]}
+        if cfg.flavor == "vllm":
+            data = [{"id": m, "object": "model", "owned_by": "vllm", "max_model_len": cfg.max_model_len}
+                    for m in cfg.models]
+        else:
+            data = [{"id": m, "object": "model", "owned_by": "library"} for m in cfg.models]
+        return {"object": "list", "data": data}
+
+    @app.get("/version")
+    async def vllm_version():
+        if cfg.flavor != "vllm":
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        return {"version": "0.0.0-mock"}
 
     @app.get("/api/version")
     async def version():
+        if cfg.flavor != "ollama":
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
         return {"version": cfg.ollama_version}
 
     @app.post("/api/show")
@@ -88,10 +103,12 @@ def make_app(cfg: MockConfig, state: MockState) -> FastAPI:
             return JSONResponse({"error": {"message": cfg.error_message}}, status_code=500)
 
         limit = body.get("max_tokens") or (cfg.reasoning_tokens + cfg.tokens)
+        # vLLM 처럼 ignore_eos 면 max_tokens 까지 생성
+        content_tokens = max(cfg.tokens, limit) if body.get("ignore_eos") else cfg.tokens
         n_reason = min(cfg.reasoning_tokens, limit)
-        n_content = min(cfg.tokens, limit - n_reason)
+        n_content = min(content_tokens, limit - n_reason)
         n = n_reason + n_content
-        finish = "length" if cfg.reasoning_tokens + cfg.tokens > limit else "stop"
+        finish = "length" if cfg.reasoning_tokens + content_tokens > limit or body.get("ignore_eos") else "stop"
         p_tok = cfg.prompt_tokens(body["messages"][-1]["content"])
 
         if not body.get("stream"):
@@ -162,3 +179,57 @@ class MockServer:
     def __exit__(self, *exc) -> None:
         self._server.should_exit = True
         self._thread.join(timeout=5)
+
+
+def main() -> None:
+    """별도 프로세스로 띄우기 (batch 테스트에서 `vllm serve` 대신). 예:
+
+    python mock_openai.py --port 8000 --model org/m --flavor vllm --tokenizer tok.json --overhead 29
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--flavor", default="vllm", choices=["vllm", "ollama"])
+    ap.add_argument("--tokenizer", help="tokenizer.json — prompt_tokens = overhead + 본문 토큰 수")
+    ap.add_argument("--overhead", type=int, default=29)
+    ap.add_argument("--max-model-len", type=int, default=4096)
+    ap.add_argument("--tokens", type=int, default=8)
+    ap.add_argument("--itl", type=float, default=0.001, help="토큰 간격(초)")
+    ap.add_argument("--startup-delay", type=float, default=0.0, help="이만큼 기다린 뒤 서빙 (모델 적재 흉내)")
+    ap.add_argument("--oom-at", type=int, default=0, help="이 번째 생성 요청에서 OOM 로그를 쓰고 종료")
+    args = ap.parse_args()
+
+    counter = lambda s: 5  # noqa: E731
+    if args.tokenizer:
+        from tokenizers import Tokenizer
+
+        tok = Tokenizer.from_file(args.tokenizer)
+        counter = lambda s: args.overhead + len(tok.encode(s, add_special_tokens=False).ids)  # noqa: E731
+    cfg = MockConfig(
+        first_token_delay_s=0.005, inter_token_delay_s=args.itl, tokens=args.tokens, prompt_tokens=counter,
+        models=(args.model,), flavor=args.flavor, max_model_len=args.max_model_len,
+    )
+    state = MockState()
+    app = make_app(cfg, state)
+    if args.oom_at:
+        import os
+        import sys
+
+        @app.middleware("http")
+        async def oom(request, call_next):
+            if request.url.path.endswith("/chat/completions") and state.requests + 1 >= args.oom_at:
+                print("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB", flush=True)
+                sys.stdout.flush()
+                os._exit(1)
+            return await call_next(request)
+
+    time.sleep(args.startup_delay)
+    print(f"mock serving {args.model} ({args.flavor}) on {args.host}:{args.port}", flush=True)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()

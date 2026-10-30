@@ -42,9 +42,13 @@ def hf_config(hf_id: str, revision: str = "main") -> dict:
     return json.loads(hf_download(hf_id, "config.json", revision).read_text(encoding="utf-8"))
 
 
-def hf_param_count(hf_id: str) -> int | None:
-    """HF API 의 safetensors 메타데이터 파라미터 수. 없으면 None."""
-    resp = httpx.get(_API_URL.format(hf_id=hf_id), headers=_headers(), timeout=_TIMEOUT_S)
-    resp.raise_for_status()
-    total = (resp.json().get("safetensors") or {}).get("total")
+def hf_param_count(hf_id: str, root: Path | None = None) -> int | None:
+    """HF API 의 safetensors 메타데이터 파라미터 수. 없으면 None. 응답은 캐시한다."""
+    path = (root or cache_dir()) / "hf" / hf_id.replace("/", "--") / "api.json"
+    if not path.exists():
+        resp = httpx.get(_API_URL.format(hf_id=hf_id), headers=_headers(), timeout=_TIMEOUT_S)
+        resp.raise_for_status()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(resp.content)
+    total = (json.loads(path.read_text(encoding="utf-8")).get("safetensors") or {}).get("total")
     return int(total) if total else None

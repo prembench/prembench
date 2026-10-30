@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from prembench import __version__
+from prembench.batch import fmt_minutes, load_matrix, plan, run_matrix
 from prembench.cell import Cell, CellError, Session, Target, run_cell
 from prembench.config import config_path, load_config
 from prembench.load import NotReadyError
@@ -362,6 +363,65 @@ def grid(
         err=True,
     )
     if measured == 0:
+        raise typer.Exit(1)
+
+
+@app.command()
+def batch(
+    matrix: Path = typer.Argument(..., exists=True, dir_okay=False, help="조합 파일 (matrix.toml)"),
+    out_dir: Path | None = typer.Option(None, "--out-dir", help="records/ logs/ summary.json 을 쓸 곳"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="실행하지 않고 계획과 예상 시간·비용만 출력"),
+    seed: int | None = typer.Option(None, "--seed", help="기준 시드. 기본: 회차마다 무작위"),
+) -> None:
+    """조합 파일의 모델마다 엔진을 띄워 격자를 측정한다 (runner/bootstrap.sh 가 부른다)."""
+    try:
+        m = load_matrix(matrix)
+    except Exception as e:  # TOML 문법·스키마 오류를 그대로 보여준다
+        typer.echo(f"error: {matrix}: {e}", err=True)
+        raise typer.Exit(2) from e
+
+    p = plan(m)
+    console = Console(stderr=True)
+    t = Table(title=f"{m.instance.provider} {m.instance.gpu} — ${m.instance.price_per_hour_usd}/h")
+    for col in ("model", "cells", "skip (max-model-len)", "time"):
+        t.add_column(col)
+    for mp in p.models:
+        t.add_row(mp.model.hf_id, str(len(mp.cells)), str(len(mp.skipped)), fmt_minutes(*mp.minutes))
+    console.print(t)
+    console.print(
+        f"예상: {fmt_minutes(*p.minutes)} (셀당 2~3회, 설치 {m.instance.setup_min:g}분 포함)  "
+        f"비용 ${p.usd[0]:.2f}~${p.usd[1]:.2f}  ≈ {p.krw[0]:,.0f}~{p.krw[1]:,.0f}원 "
+        f"(환율 {m.instance.usd_krw:g})"
+    )
+    console.print("[dim]예상치는 예산용 — 레코드에 들어가지 않는다[/]")
+    if p.over_cap:
+        console.print(f"[bold yellow]warning[/]: 최악 예상이 max_hours {m.instance.max_hours:g}h 를 넘음 — 중간에 강제 종료될 수 있다")
+    if dry_run:
+        return
+    if out_dir is None:
+        typer.echo("error: --out-dir 필요", err=True)
+        raise typer.Exit(2)
+
+    batch_prefix = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}"
+
+    def progress(mc, o: CellOutcome) -> None:
+        if o.skipped:
+            typer.echo(f"skip  {mc.served_name} {o.cell}: {o.skipped}", err=True)
+        for r in o.records:
+            mark = "*" if r.repetition.representative else " "
+            typer.echo(f"{mark}{r.repetition.index}/{r.repetition.count} {mc.served_name} {o.cell}: {_summary(r)}",
+                       err=True)
+        if o.error:
+            typer.echo(f"fail  {mc.served_name} {o.cell}: {o.error}", err=True)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", SchemaWarning)
+        results = asyncio.run(run_matrix(m, out_dir, batch_prefix, seed=seed, on_cell=progress))
+    _echo_warnings(caught)
+    for r in results:
+        status = f"error: {r.error}" if r.error else "ok"
+        typer.echo(f"model {r.hf_id}: {r.records} records, {len(r.cells)} cells — {status}", err=True)
+    if not any(r.records for r in results):
         raise typer.Exit(1)
 
 

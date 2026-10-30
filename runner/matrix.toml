@@ -1,0 +1,34 @@
+# 이번 주말 조합 — prembench batch / runner/bootstrap.sh 가 읽는다.
+# 가격·환율·버전은 예시 값이다. 인스턴스를 빌리기 전에 실제 값으로 바꾸고
+#   prembench batch runner/matrix.toml --dry-run
+# 으로 예상 시간·비용을 확인한다.
+
+submitter = "example-user"
+provenance = "self"
+
+[instance]
+provider = "RunPod"
+gpu = "RTX 4090"              # 계획 표시용. 레코드의 GPU 는 probe 가 잰다
+price_per_hour_usd = 0.69     # 예시 — 빌릴 때 실제 가격으로
+usd_krw = 1400                # 예시 — 예상 비용 원화 환산용
+max_hours = 3                 # 넘으면 bootstrap 이 인스턴스를 강제 종료 (비용 상한)
+setup_min = 10                # 설치 예상 분
+
+[engine]
+name = "vllm"
+version = "0.11.0"            # 예시 — 측정 시점의 최신 안정 버전으로 고정
+port = 8000
+startup_timeout_min = 30
+# command 기본값: vllm serve {hf_id} --host 127.0.0.1 --port {port}
+#                 --tensor-parallel-size {tp} --pipeline-parallel-size {pp} {args}
+
+[grid]
+concurrency = [1, 4, 16, 64]
+shapes = ["512x128", "2048x512", "8192x512", "32768x512"]
+min_duration_s = 60
+ignore_eos = true
+
+[[models]]
+hf_id = "Qwen/Qwen2.5-7B-Instruct"
+args = "--max-model-len 33280 --gpu-memory-utilization 0.90"
+startup_min = 8               # 다운로드·적재 예상 분 (HF 캐시가 볼륨에 있으면 짧아짐)

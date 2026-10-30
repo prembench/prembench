@@ -120,6 +120,10 @@ class CellOutcome:
     retried: list[str] = field(default_factory=list)  # 프롬프트 토큰 불일치로 다시 잰 회차의 사유
 
     @property
+    def oom(self) -> bool:
+        return bool(self.oom_log) or any(r.result.oom for r in self.records)
+
+    @property
     def representative(self) -> Run | None:
         return next((r for r in self.records if r.repetition.representative), None)
 
@@ -169,7 +173,10 @@ async def run_grid(
                         pos = log.mark() if log else 0
                         run = await session.measure(cell, next(seeds))
                 except (CellError, NotReadyError) as e:
-                    out.error = str(e)
+                    # 준비 확인 중에 죽은 경우도 엔진 로그에 OOM 흔적이 있으면 남긴다 (레코드는 없음)
+                    hits = log.oom_lines(pos) if log else []
+                    out.oom_log.extend(hits)
+                    out.error = f"OOM (엔진 로그) — {e}" if hits else str(e)
                     break
                 out.short_duration |= session.last_pool_exhausted
                 hits = log.oom_lines(pos) if log else []

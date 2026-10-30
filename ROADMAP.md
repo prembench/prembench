@@ -164,6 +164,7 @@ prembench/                      # 확정 (2026-10-30)
 │       ├── prompts.py         # 고정 시드 랜덤 프롬프트 (정확한 토큰 수)
 │       ├── metrics.py         # p50/p95 계산 (nearest-rank)
 │       ├── cell.py            # 셀 1개: probe → 프롬프트 → 부하 → 지표 → Run 조립
+│       ├── batch.py           # matrix.toml: 모델마다 엔진 기동 → 격자 → 종료, 예상 비용
 │       ├── config.py          # ~/.prembench/config (TOML)
 │       ├── hf.py              # HF Hub 파일·메타데이터 (httpx)
 │       ├── schema.py          # pydantic 모델 (1.1)
@@ -171,7 +172,7 @@ prembench/                      # 확정 (2026-10-30)
 │       └── submit.py          # POST to API
 ├── runner/                    # 클라우드 인스턴스용 자동화
 │   ├── bootstrap.sh           # 인스턴스 부팅 → vllm 설치 → 모델 캐시 → 격자 실행 → 제출 → 종료
-│   └── matrix.yaml            # 이번 주말에 돌릴 조합
+│   └── matrix.toml            # 이번 주말에 돌릴 조합 (prembench batch 가 읽음)
 ├── data/                      # 제출 원본 JSON (git)
 │   └── 2026/11/...
 ├── web/                       # Next.js
@@ -228,7 +229,9 @@ Claude Code 세션 프롬프트 예:
 
 #### W3 (이번 주) — grid.py + bootstrap.sh
 - [x] `grid.py` — 1.2 격자 순회, OOM 감지(5xx + 엔진 로그), 반복·중앙값
-- [ ] `runner/bootstrap.sh` — RunPod 템플릿: vllm 설치 → HF 캐시 볼륨 → `vllm serve` → 격자 → 결과 업로드 → `shutdown`. `--dry-run` 은 예상 비용 출력
+- [x] `runner/bootstrap.sh` — RunPod 템플릿: vllm 설치 → HF 캐시 볼륨 → `vllm serve` → 격자 → 결과 업로드 → `shutdown`. `--dry-run` 은 예상 비용 출력
+  - 조합은 `runner/matrix.toml` (YAML 대신 TOML — 표준 라이브러리로 읽혀 의존성이 늘지 않음)
+  - 엔진 기동·준비 확인·격자·종료는 `prembench batch` (Python), 설치·볼륨·업로드·종료·비용 상한(`max_hours`)은 bootstrap.sh
 - 완료 기준: mock 으로 16셀 격자 완주, `--dry-run` 이 예상 비용 출력
 
 #### W3.5 (11/3~) — 집 PC 첫 실 GPU 실행
