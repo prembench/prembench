@@ -150,9 +150,9 @@ def test_content_tokens_for():
 
 def test_load_hf_tokenizer_uses_cache(bpe, tmp_path, monkeypatch):
     # 캐시에 있으면 네트워크를 타지 않는다
-    dest = tmp_path / "org--model" / "main" / "tokenizer.json"
+    dest = tmp_path / "hf" / "org--model" / "main" / "tokenizer.json"
     dest.parent.mkdir(parents=True)
     bpe._tok.save(str(dest))
-    monkeypatch.setattr("prembench.prompts.httpx.get", lambda *a, **k: pytest.fail("network"))
-    tok = load_hf_tokenizer("org/model", cache_dir=tmp_path)
+    monkeypatch.setattr("prembench.hf.httpx.get", lambda *a, **k: pytest.fail("network"))
+    tok = load_hf_tokenizer("org/model", cache_root=tmp_path)
     assert tok.encode("the fox") == bpe.encode("the fox")

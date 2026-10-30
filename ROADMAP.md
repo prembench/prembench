@@ -129,6 +129,10 @@ result:
 - 입력 프롬프트는 고정 시드 랜덤 토큰 (캐시 효과 제거). 한국어 토큰 비율 옵션 (`--lang ko`).
   - 모델 HF 토크나이저로 본문을 정확히 N 토큰으로 만들고, chat template 오버헤드는 엔진 usage.prompt_tokens 로 실측
     (길이 2개로 재서 다르면 토크나이저 불일치 → 측정 중단). 본문 = input_tokens − 오버헤드.
+  - 시드는 레코드에 기록(random_seed). 기본은 실행마다 새로 뽑는다 — 같은 시드를 다시 쓰면 이전 실행의
+    프롬프트가 엔진 prefix 캐시에 남아 결과가 부풀려진다. 반복 측정(2·3회째)도 시드를 바꾼다.
+  - 측정 후 모든 요청의 usage.prompt_tokens == input_tokens 를 확인. 다르면(엔진 context 한도로 잘림 등) 레코드를 내지 않는다.
+- 백분위는 nearest-rank (보간 없음). 지연·처리량은 성공 요청만으로 계산하고 실패는 error_count·finish_reason 으로 남긴다.
 - 각 셀 최소 `request_count = concurrency × 5` 또는 60초 중 긴 쪽.
 - `nvidia-smi --query-gpu` 1초 샘플링을 백그라운드로.
 - 같은 셀 2회 반복, 편차 10% 넘으면 3회째 돌리고 중앙값.
@@ -148,7 +152,10 @@ prembench/                      # 확정 (2026-10-30)
 │       ├── probe.py           # 하드웨어·엔진 자동 감지
 │       ├── load.py            # async 부하 생성
 │       ├── prompts.py         # 고정 시드 랜덤 프롬프트 (정확한 토큰 수)
-│       ├── metrics.py         # p50/p95 계산
+│       ├── metrics.py         # p50/p95 계산 (nearest-rank)
+│       ├── cell.py            # 셀 1개: probe → 프롬프트 → 부하 → 지표 → Run 조립
+│       ├── config.py          # ~/.prembench/config (TOML)
+│       ├── hf.py              # HF Hub 파일·메타데이터 (httpx)
 │       ├── schema.py          # pydantic 모델 (1.1)
 │       ├── grid.py            # 격자 실행
 │       └── submit.py          # POST to API
@@ -200,11 +207,11 @@ Claude Code 세션 프롬프트 예:
 "ROADMAP.md 1.1 의 필드를 pydantic v2 모델로 만들어. 각 필드에 단위를 docstring 으로. JSON Schema 를 schema/run.schema.json 으로 내보내는 명령도 추가."
 
 ### W2 (11/8~9) — 부하 생성기
-- [ ] `load.py` — asyncio + httpx, 스트리밍 응답에서 첫 토큰 시각·토큰 간격 기록
-- [ ] 고정 시드 랜덤 프롬프트 생성 (tokenizer로 정확한 토큰 수)
-- [ ] `metrics.py` — p50/p95/p99, per-user tps
-- [ ] mock OpenAI 서버로 pytest
-- [ ] 맥북에서 Ollama 작은 모델 띄워 end-to-end 1셀 성공
+- [x] `load.py` — asyncio + httpx, 스트리밍 응답에서 첫 토큰 시각·토큰 간격 기록
+- [x] 고정 시드 랜덤 프롬프트 생성 (tokenizer로 정확한 토큰 수)
+- [x] `metrics.py` — p50/p95/p99, per-user tps
+- [x] mock OpenAI 서버로 pytest
+- [x] 맥북에서 Ollama 작은 모델 띄워 end-to-end 1셀 성공
 - 완료 기준: `prembench run --url http://localhost:11434/v1 --model X --concurrency 4 --in 512 --out 128` 이 JSON 1개를 뱉음
 
 ### W3 (11/15~16) — 격자 + 자동화

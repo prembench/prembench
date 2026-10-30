@@ -30,6 +30,9 @@ class MockConfig:
     send_usage: bool = True
     # 본문 문자열 → usage.prompt_tokens. 엔진의 토크나이저 + chat template 역할
     prompt_tokens: Callable[[str], int] = lambda content: 5
+    # Ollama 흉내용 (/v1/models, /api/*)
+    models: tuple[str, ...] = ("mock",)
+    ollama_version: str = "0.0.0-mock"
 
 
 @dataclass
@@ -42,6 +45,39 @@ class MockState:
 
 def make_app(cfg: MockConfig, state: MockState) -> FastAPI:
     app = FastAPI()
+
+    @app.get("/v1/models")
+    async def models():
+        return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "library"} for m in cfg.models]}
+
+    @app.get("/api/version")
+    async def version():
+        return {"version": cfg.ollama_version}
+
+    @app.post("/api/show")
+    async def show(req: Request):
+        name = (await req.json())["model"]
+        if name not in cfg.models:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return {
+            "template": "{{ .Prompt }}",
+            "details": {"format": "gguf", "quantization_level": "Q4_K_M"},
+            "model_info": {
+                "general.architecture": "mockarch",
+                "general.parameter_count": 1_500_000_000,
+                "mockarch.context_length": 32768,
+            },
+        }
+
+    @app.get("/api/tags")
+    async def tags():
+        return {"models": [{"name": m, "model": m, "size": 1_000_000_000} for m in cfg.models]}
+
+    @app.get("/api/ps")
+    async def ps():
+        # 생성 요청을 한 번이라도 받으면 적재된 것으로 본다
+        loaded = cfg.models if state.requests else ()
+        return {"models": [{"name": m, "model": m, "context_length": 4096} for m in loaded]}
 
     @app.post("/v1/chat/completions")
     async def chat(req: Request):

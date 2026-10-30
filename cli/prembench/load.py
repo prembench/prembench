@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from prembench.probe import gpu_temperature_c
+from prembench.probe import GpuSample, GpuSampler, gpu_temperature_c
 from prembench.schema import FinishReason, PerRequest, Sampling
 
 _CONNECT_TIMEOUT_S = 10
@@ -56,6 +56,7 @@ class RequestRecord:
     completion_tokens: int | None = None  # 엔진 보고 usage. 없으면 None
     reasoning_tokens: int | None = None  # usage.completion_tokens_details.reasoning_tokens. 없으면 None
     prompt_tokens: int | None = None
+    cached_tokens: int | None = None  # usage.prompt_tokens_details.cached_tokens (prefix 캐시 적중). 없으면 None
 
     @property
     def ok(self) -> bool:
@@ -123,6 +124,7 @@ class LoadRun:
     gpu_temp_start_c: float | None
     gpu_temp_end_c: float | None
     ignore_eos: bool
+    gpu_samples: list[GpuSample] | None = None  # 측정 구간 nvidia-smi 샘플. 샘플러가 없으면 None
 
     def per_request(self) -> list[PerRequest]:
         return [r.to_per_request(self.measure_start_s) for r in self.records]
@@ -209,6 +211,7 @@ async def _one_request(
         completion_tokens=usage.get("completion_tokens"),
         reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
         prompt_tokens=usage.get("prompt_tokens"),
+        cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
     )
 
 
@@ -275,11 +278,14 @@ async def run_load(
     timeout_s: float = _DEFAULT_TIMEOUT_S,
     headers: dict[str, str] | None = None,
     gpu_temp: Callable[[], float | None] = gpu_temperature_c,
+    gpu_sampler: GpuSampler | None = None,
+    ready_prompt: str | None = None,
 ) -> LoadRun:
     """준비 확인 1건 → 워밍업 `warmup_count` 개 → 측정 `request_count` 개. `prompts` 는 순환해서 쓴다.
 
     base_url 은 `/v1` 까지 포함. 예: http://localhost:11434/v1
-    extra_body 는 엔진별 옵션 (예: vLLM 의 {"ignore_eos": True, "min_tokens": N}).
+    extra_body 는 엔진별 옵션 (예: vLLM 의 {"min_tokens": N}).
+    ready_prompt: 준비 확인용 프롬프트. 측정 프롬프트와 겹치면 prefix 캐시가 첫 측정을 부풀리므로 따로 주는 게 좋다.
     """
     if concurrency < 1 or request_count < 1 or warmup_count < 0:
         raise ValueError("concurrency>=1, request_count>=1, warmup_count>=0")
@@ -294,7 +300,9 @@ async def run_load(
     timeout = httpx.Timeout(timeout_s, connect=_CONNECT_TIMEOUT_S)
     async with httpx.AsyncClient(limits=limits, timeout=timeout, headers=headers) as client:
         t0 = time.perf_counter()
-        ready_body = {**body(0), "max_tokens": min(sampling.max_tokens, _READY_MAX_TOKENS)}
+        ready_body = request_body(model, ready_prompt if ready_prompt is not None else prompts[0],
+                                  sampling, extra_body, ignore_eos)
+        ready_body["max_tokens"] = min(sampling.max_tokens, _READY_MAX_TOKENS)
         ready = await _one_request(client, url, ready_body, -1, True, t0)
         if not ready.ok:
             raise NotReadyError(f"준비 확인 실패, 측정 시작 안 함: {ready.error}")
@@ -303,6 +311,8 @@ async def run_load(
             client, url, [body(i) for i in range(warmup_count)], concurrency, True, t0
         )
         temp_start = await asyncio.to_thread(gpu_temp)
+        if gpu_sampler is not None:
+            gpu_sampler.start()
         measure_start = time.perf_counter() - t0
         measured = await _phase(
             client,
@@ -313,5 +323,8 @@ async def run_load(
             t0,
         )
         measure_end = time.perf_counter() - t0
+        samples = await asyncio.to_thread(gpu_sampler.stop) if gpu_sampler is not None else None
         temp_end = await asyncio.to_thread(gpu_temp)
-    return LoadRun(ready, measured, warm, measure_start, measure_end, temp_start, temp_end, ignore_eos)
+    return LoadRun(
+        ready, measured, warm, measure_start, measure_end, temp_start, temp_end, ignore_eos, samples
+    )

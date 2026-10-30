@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import os
 import random
 import re
 from dataclasses import dataclass
@@ -20,11 +19,11 @@ from typing import Protocol
 
 import httpx
 
+from prembench.hf import hf_download
+
 _HANGUL = re.compile(r"[가-힣]")
 _MAX_FIT_ROUNDS = 50
 _CALIBRATION_LENGTHS = (16, 64)
-_HF_URL = "https://huggingface.co/{hf_id}/resolve/{revision}/tokenizer.json"
-_CACHE_DIR = Path(os.environ.get("PREMBENCH_CACHE", Path.home() / ".cache" / "prembench")) / "tokenizers"
 
 
 class Tokenizer(Protocol):
@@ -60,20 +59,9 @@ class HFTokenizer:
         return sorted(i for i in self._tok.get_vocab(with_added_tokens=False).values() if i not in added)
 
 
-def load_hf_tokenizer(hf_id: str, revision: str = "main", cache_dir: Path = _CACHE_DIR) -> HFTokenizer:
-    """HF Hub 에서 tokenizer.json 을 받아 캐시. gated 모델은 HF_TOKEN 환경변수."""
-    path = cache_dir / hf_id.replace("/", "--") / revision / "tokenizer.json"
-    if not path.exists():
-        headers = {"Authorization": f"Bearer {t}"} if (t := os.environ.get("HF_TOKEN")) else {}
-        resp = httpx.get(
-            _HF_URL.format(hf_id=hf_id, revision=revision), headers=headers, follow_redirects=True, timeout=60
-        )
-        resp.raise_for_status()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(resp.content)
-        tmp.replace(path)
-    return HFTokenizer.from_file(path)
+def load_hf_tokenizer(hf_id: str, revision: str = "main", cache_root: Path | None = None) -> HFTokenizer:
+    """HF Hub 에서 tokenizer.json 을 받아 캐시 (hf.cache_dir()). gated 모델은 HF_TOKEN 환경변수."""
+    return HFTokenizer.from_file(hf_download(hf_id, "tokenizer.json", revision, cache_root))
 
 
 @dataclass

@@ -48,7 +48,7 @@ prembench probe                  # 맥북에서는 "no GPU — NVIDIA GPU 미검
 `dev` 엑스트라는 pytest, pytest-asyncio, `load.py` 테스트용 mock 서버(fastapi, uvicorn),
 그리고 `tokenizer` 엑스트라(HF `tokenizers`, 프롬프트 토큰 수 맞추기용)다.
 런타임 기본 의존성은 typer, httpx, pydantic, rich 뿐이다.
-토크나이저 파일은 첫 사용 시 HF 에서 받아 `~/.cache/prembench/tokenizers/` 에 캐시한다 (gated 모델은 `HF_TOKEN`).
+토크나이저 파일은 첫 사용 시 HF 에서 받아 `~/.cache/prembench/hf/` 에 캐시한다 (gated 모델은 `HF_TOKEN`).
 
 테스트:
 
@@ -77,8 +77,29 @@ prembench probe --url http://localhost:11434/v1     # engine: ollama <버전>
 cd cli && PREMBENCH_OLLAMA_URL=http://localhost:11434/v1 pytest -q tests/test_load_ollama.py
 ```
 
-참고: Ollama 는 Metal(GPU) 로 돌지만 레코드 스키마의 하드웨어는 NVIDIA 기준이라
-맥북 결과는 DB 대상이 아니다.
+### 셀 1개 측정 (`prembench run`)
+
+제출자 정보와 모델 이름 → HF ID 매핑을 `~/.prembench/config` (TOML) 에 둔다. 값은 예시:
+
+```toml
+submitter = "example-user"
+provenance = "self"          # self | community | scraped | vendor
+environment = "on_prem"      # cloud_rented 면 provider 도
+
+[hf_ids]
+"qwen2.5:1.5b" = "Qwen/Qwen2.5-1.5B-Instruct"
+```
+
+```sh
+prembench run --url http://localhost:11434/v1 --model qwen2.5:1.5b \
+  --concurrency 4 --in 512 --out 128 --out-file /tmp/run.json
+```
+
+빠진 값이 있으면 묻지 않고 무엇이 빠졌는지 알려주고 종료한다. 모든 값은 옵션(`--submitter` 등)으로도 줄 수 있다.
+Ollama 기본 context(4096) 보다 긴 `--in` 은 엔진이 잘라 버리므로, 프롬프트 토큰 검사에서 실패한다.
+
+참고: 맥북 레코드의 `gpu_vram_gb` 는 통합 메모리 전체 크기(CPU 와 공유)이고, Ollama 는 `ignore_eos` 를
+적용하지 않아 출력이 `--out` 보다 일찍 끝날 수 있다. 맥북 결과는 DB 대상이 아니다.
 
 ## 5. Claude Code
 

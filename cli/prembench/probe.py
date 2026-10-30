@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import platform
@@ -14,6 +15,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 
 import httpx
@@ -306,3 +310,161 @@ def probe_engine(url: str, client: httpx.Client | None = None) -> EngineProbe:
 
 def as_dict(host: HostProbe, engine: EngineProbe | None) -> dict:
     return {"host": asdict(host), "engine": asdict(engine) if engine else None}
+
+
+# ---------------------------------------------------------------- Apple Silicon
+
+
+def apple_hardware() -> Hardware | None:
+    """Apple Silicon 내장 GPU. NVIDIA 가 없을 때만 쓴다 (개발용 맥북 측정).
+
+    gpu_vram_gb 는 통합 메모리 전체 크기다 — CPU 와 공유하므로 전용 VRAM 과 다르다.
+    """
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        return None
+    chip = _cpu_model()
+    ram = _ram_gb()
+    if not chip or not ram:
+        return None
+    return Hardware(
+        gpu_model=chip, gpu_count=1, gpu_vram_gb=ram, interconnect="none",
+        cpu_model=chip, ram_gb=ram, driver_version=None, cuda_version=None,
+        gpu_power_limit_w=None, gpu_clock_locked=None, pcie_gen=None, pcie_lanes=None, numa_nodes=None,
+    )
+
+
+# ---------------------------------------------------------------- GPU 샘플링 (nvidia-smi 1초)
+
+_SAMPLE_QUERY = "index,memory.used,utilization.gpu,power.draw"
+
+
+@dataclass
+class GpuSample:
+    t_s: float  # time.perf_counter()
+    gpu: int
+    mem_used_gb: float | None
+    util_pct: float | None
+    power_w: float | None
+
+
+def _num(s: str) -> float | None:
+    try:
+        return float(s.strip())
+    except ValueError:
+        return None  # "[N/A]" 등
+
+
+def parse_samples(text: str, t_s: float) -> list[GpuSample]:
+    """`nvidia-smi --query-gpu=index,memory.used,utilization.gpu,power.draw --format=csv,noheader,nounits`."""
+    out = []
+    for line in text.splitlines():
+        parts = line.split(",")
+        if len(parts) != 4 or _num(parts[0]) is None:
+            continue
+        mem = _num(parts[1])
+        out.append(GpuSample(t_s, int(_num(parts[0])), mem / 1024 if mem is not None else None,
+                             _num(parts[2]), _num(parts[3])))
+    return out
+
+
+class GpuSampler:
+    """측정 구간 동안 백그라운드 스레드로 nvidia-smi 를 1초마다 읽는다. nvidia-smi 가 없으면 create() 가 None."""
+
+    def __init__(self, read: Callable[[], str | None], interval_s: float = 1.0) -> None:
+        self._read = read
+        self._interval = interval_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self.samples: list[GpuSample] = []
+
+    @classmethod
+    def create(cls) -> GpuSampler | None:
+        smi = shutil.which("nvidia-smi")
+        if smi is None:
+            return None
+        return cls(lambda: _run([smi, f"--query-gpu={_SAMPLE_QUERY}", "--format=csv,noheader,nounits"]))
+
+    def _tick(self) -> None:
+        t = time.perf_counter()
+        text = self._read()
+        if text:
+            self.samples.extend(parse_samples(text, t))
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._tick()
+            self._stop.wait(self._interval)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> list[GpuSample]:
+        self._stop.set()
+        self._thread.join(timeout=10)
+        self._tick()  # 종료 시점 1회 더
+        return self.samples
+
+
+# ---------------------------------------------------------------- Ollama 메타데이터
+
+
+@dataclass
+class OllamaModel:
+    parameter_count: int | None
+    quantization_level: str | None  # 예: "Q4_K_M"
+    context_length_max: int | None  # gguf 메타데이터 (모델 최대)
+    expert_count: int | None
+    template_sha256: str | None
+    size_bytes: int | None  # gguf 파일 크기 (/api/tags)
+
+
+def _post_json(client: httpx.Client, url: str, body: dict) -> dict | None:
+    try:
+        r = client.post(url, json=body)
+    except httpx.HTTPError:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def probe_ollama_model(url: str, model: str, client: httpx.Client | None = None) -> OllamaModel | None:
+    own = client is None
+    client = client or httpx.Client(timeout=_TIMEOUT_S)
+    try:
+        root = _root(url)
+        show = _post_json(client, root + "/api/show", {"model": model})
+        if show is None:
+            return None
+        info = show.get("model_info") or {}
+        arch = info.get("general.architecture")
+        template = show.get("template")
+        tags = _get_json(client, root + "/api/tags") or {}
+        size = next((m.get("size") for m in tags.get("models", []) if model in (m.get("name"), m.get("model"))), None)
+        return OllamaModel(
+            parameter_count=info.get("general.parameter_count"),
+            quantization_level=(show.get("details") or {}).get("quantization_level"),
+            context_length_max=info.get(f"{arch}.context_length") if arch else None,
+            expert_count=info.get(f"{arch}.expert_count") if arch else None,
+            template_sha256=hashlib.sha256(template.encode()).hexdigest() if template else None,
+            size_bytes=size,
+        )
+    finally:
+        if own:
+            client.close()
+
+
+def ollama_loaded(url: str, model: str, client: httpx.Client | None = None) -> dict | None:
+    """/api/ps 의 해당 모델 항목 (적재돼 있지 않으면 None). context_length 는 실제 런너 설정값."""
+    own = client is None
+    client = client or httpx.Client(timeout=_TIMEOUT_S)
+    try:
+        ps = _get_json(client, _root(url) + "/api/ps") or {}
+        return next((m for m in ps.get("models", []) if model in (m.get("name"), m.get("model"))), None)
+    finally:
+        if own:
+            client.close()

@@ -53,3 +53,29 @@ async def test_ollama_exact_input_tokens():
             concurrency=1, request_count=2,
         )
         assert [r.prompt_tokens for r in run.records] == [target, target]
+
+
+def test_ollama_run_command_emits_valid_record(tmp_path, monkeypatch):
+    """W2 완료 기준: prembench run 이 스키마 검증을 통과하는 JSON 1개를 낸다."""
+    import warnings
+
+    from typer.testing import CliRunner
+
+    from prembench.__main__ import app
+    from prembench.schema import Run
+
+    monkeypatch.setenv("PREMBENCH_CONFIG", str(tmp_path / "none"))  # 설정 파일 없이 옵션만
+    out = tmp_path / "rec.json"
+    res = CliRunner().invoke(app, [
+        "run", "--url", URL, "--model", MODEL, "--concurrency", "4", "--in", "512", "--out", "128",
+        "--hf-id", os.environ.get("PREMBENCH_OLLAMA_HF_ID", "Qwen/Qwen2.5-1.5B-Instruct"),
+        "--submitter", "example-user", "--provenance", "self", "--environment", "on_prem",
+        "--out-file", str(out),
+    ])
+    assert res.exit_code == 0, res.output
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        run = Run.model_validate_json(out.read_text())
+    assert run.engine.name == "ollama" and run.load.ignore_eos is None
+    assert run.result.error_count == 0
+    assert all(p.prompt_tokens == 512 for p in run.result.per_request)
