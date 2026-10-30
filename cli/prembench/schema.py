@@ -18,6 +18,9 @@ Provider = Literal["RunPod", "Vast", "Lambda"]
 Interconnect = Literal["PCIe", "NVLink", "none"]
 Quantization = Literal["bf16", "fp8", "awq-int4", "gptq-int4", "gguf-q4"]
 EngineName = Literal["vllm", "sglang", "ollama", "tgi"]
+LoadMode = Literal["closed_loop", "open_loop"]
+ArrivalProcess = Literal["poisson", "constant"]
+TokenCountSource = Literal["engine_usage", "client_tokenizer"]
 
 
 class _Strict(BaseModel):
@@ -34,6 +37,11 @@ class Hardware(_Strict):
     ram_gb: float | None = Field(ge=0, description="시스템 RAM, 단위 GB")
     driver_version: str | None = Field(description="NVIDIA 드라이버 버전")
     cuda_version: str | None = Field(description="CUDA 버전")
+    gpu_power_limit_w: float | None = Field(gt=0, description="GPU 1장당 전력 제한, 단위 W (nvidia-smi power.limit)")
+    gpu_clock_locked: bool | None = Field(description="GPU 클럭 고정(nvidia-smi -lgc 등) 여부")
+    pcie_gen: int | None = Field(ge=1, description="GPU PCIe 링크 세대 (현재값)")
+    pcie_lanes: int | None = Field(ge=1, description="GPU PCIe 링크 폭 (현재값), 단위 레인")
+    numa_nodes: int | None = Field(ge=1, description="호스트 NUMA 노드 수")
 
 
 class Model(_Strict):
@@ -46,6 +54,19 @@ class Model(_Strict):
     max_position_embeddings: int | None = Field(
         ge=1, description="모델 config 의 max_position_embeddings, 단위 토큰"
     )
+    moe: bool | None = Field(description="Mixture-of-Experts 모델 여부")
+    active_params_b: float | None = Field(
+        gt=0, description="토큰당 활성 파라미터 수, 단위 십억(B). dense 모델이면 params_b 와 같다"
+    )
+    chat_template_applied: bool | None = Field(
+        description="요청에 모델 chat template 이 적용됐는지 (chat/completions 면 엔진이 적용)"
+    )
+
+    @model_validator(mode="after")
+    def _check_active_params(self) -> Model:
+        if self.active_params_b is not None and self.active_params_b > self.params_b:
+            raise ValueError(f"active_params_b({self.active_params_b}) > params_b({self.params_b})")
+        return self
 
 
 class Engine(_Strict):
@@ -60,6 +81,17 @@ class Engine(_Strict):
     kv_cache_dtype: str | None = Field(description="KV 캐시 dtype. 예: 'auto', 'fp8'")
     enable_prefix_caching: bool | None = Field(description="prefix 캐싱 활성화 여부")
     extra_args: str | None = Field(description="그 밖의 엔진 실행 인자 원문")
+    attention_backend: str | None = Field(description="어텐션 백엔드. 예: 'FLASH_ATTN', 'FLASHINFER'")
+    cuda_graphs: bool | None = Field(description="CUDA graph 사용 여부 (vLLM --enforce-eager 면 false)")
+    chunked_prefill: bool | None = Field(description="chunked prefill 활성화 여부")
+    max_num_seqs: int | None = Field(ge=1, description="엔진의 동시 처리 시퀀스 상한")
+    max_num_batched_tokens: int | None = Field(ge=1, description="스텝당 배치 토큰 상한, 단위 토큰")
+    speculative_decoding: str | None = Field(
+        description="speculative decoding 방식. 예: 'eagle', 'ngram'. 사용 안 하면 'none'"
+    )
+    engine_commit_or_image_digest: str | None = Field(
+        description="엔진 git 커밋 해시 또는 컨테이너 이미지 digest (sha256:...)"
+    )
 
 
 class Load(_Strict):
@@ -68,6 +100,36 @@ class Load(_Strict):
     output_tokens: int = Field(ge=1, description="요청당 출력 길이, 단위 토큰")
     request_count: int = Field(ge=1, description="측정 구간의 총 요청 수 (워밍업 제외)")
     warmup_count: int = Field(ge=0, description="측정 전 버린 워밍업 요청 수")
+    mode: LoadMode = Field(
+        description="closed_loop: 동시성 고정, 끝나면 즉시 다음 요청 / open_loop: 도착률 고정"
+    )
+    arrival_rate_rps: float | None = Field(
+        gt=0, description="open_loop 요청 도착률, 단위 req/s. closed_loop 면 null"
+    )
+    arrival_process: ArrivalProcess | None = Field(
+        description="open_loop 도착 간격 분포. closed_loop 면 null"
+    )
+    random_seed: int | None = Field(description="프롬프트·도착 간격 생성 난수 시드")
+
+    @model_validator(mode="after")
+    def _check_mode(self) -> Load:
+        open_fields = (self.arrival_rate_rps, self.arrival_process)
+        if self.mode == "open_loop" and None in open_fields:
+            raise ValueError("mode='open_loop' 이면 arrival_rate_rps, arrival_process 가 필요함")
+        if self.mode == "closed_loop" and open_fields != (None, None):
+            raise ValueError("mode='closed_loop' 이면 arrival_rate_rps, arrival_process 는 null 이어야 함")
+        return self
+
+
+class PerRequest(_Strict):
+    """측정 구간 요청 1개의 원시값. 실패 요청도 포함하며 재지 못한 값은 null."""
+
+    ttft_ms: float | None = Field(ge=0, description="첫 토큰까지 시간, 단위 ms")
+    e2e_ms: float | None = Field(ge=0, description="요청 송신~응답 종료, 단위 ms")
+    tpot_ms: float | None = Field(
+        ge=0, description="(e2e - ttft) / (output_tokens - 1), 단위 ms. output_tokens < 2 면 null"
+    )
+    output_tokens: int | None = Field(ge=0, description="출력 토큰 수 (token_count_source 기준)")
 
 
 class Result(_Strict):
@@ -76,6 +138,10 @@ class Result(_Strict):
     ttft_p99_ms: float | None = Field(ge=0, description="첫 토큰까지 시간 p99, 단위 ms")
     tpot_p50_ms: float | None = Field(ge=0, description="출력 토큰당 시간 p50, 단위 ms")
     tpot_p95_ms: float | None = Field(ge=0, description="출력 토큰당 시간 p95, 단위 ms")
+    e2e_p50_ms: float | None = Field(ge=0, description="요청 전체 지연 p50, 단위 ms")
+    e2e_p95_ms: float | None = Field(ge=0, description="요청 전체 지연 p95, 단위 ms")
+    e2e_p99_ms: float | None = Field(ge=0, description="요청 전체 지연 p99, 단위 ms")
+    itl_p99_ms: float | None = Field(ge=0, description="연속 토큰(청크) 도착 간격 p99, 단위 ms")
     output_tps_total: float | None = Field(ge=0, description="전체 출력 처리량, 단위 tokens/s")
     output_tps_per_user: float | None = Field(
         ge=0, description="요청(사용자) 1개당 출력 처리량, 단위 tokens/s"
@@ -89,12 +155,26 @@ class Result(_Strict):
     )
     power_avg_w: float | None = Field(ge=0, description="GPU 전력 평균, 단위 W (nvidia-smi 1초 샘플링)")
     duration_s: float | None = Field(ge=0, description="측정 구간 길이, 단위 초")
+    energy_total_j: float | None = Field(
+        ge=0, description="측정 구간 GPU 에너지 합계, 단위 J (nvidia-smi 전력 샘플 적분)"
+    )
+    energy_per_output_token_j: float | None = Field(
+        ge=0, description="energy_total_j / 측정 구간 출력 토큰 합계, 단위 J/token"
+    )
+    output_tokens_actual_mean: float | None = Field(
+        ge=0, description="요청당 실제 출력 토큰 수 평균 (요청한 output_tokens 와 다를 수 있음)"
+    )
+    token_count_source: TokenCountSource | None = Field(
+        description="출력 토큰 수 출처: 엔진 usage 보고 / 클라이언트 토크나이저 재계산. 둘 다 없으면 null"
+    )
+    per_request: list[PerRequest] = Field(description="측정 구간 요청별 원시값, 요청 순서대로")
 
     @model_validator(mode="after")
     def _percentiles_monotonic(self) -> Result:
         for name, seq in (
             ("ttft", (self.ttft_p50_ms, self.ttft_p95_ms, self.ttft_p99_ms)),
             ("tpot", (self.tpot_p50_ms, self.tpot_p95_ms)),
+            ("e2e", (self.e2e_p50_ms, self.e2e_p95_ms, self.e2e_p99_ms)),
         ):
             vals = [v for v in seq if v is not None]
             if vals != sorted(vals):
@@ -133,6 +213,15 @@ class Run(_Strict):
             raise ValueError(
                 f"tensor_parallel×pipeline_parallel({used}) > gpu_count({self.hardware.gpu_count})"
             )
+        if len(self.result.per_request) != self.load.request_count:
+            raise ValueError(
+                f"per_request 길이({len(self.result.per_request)}) != request_count({self.load.request_count})"
+            )
+        if self.result.token_count_source is None and (
+            self.result.output_tokens_actual_mean is not None
+            or any(r.output_tokens is not None for r in self.result.per_request)
+        ):
+            raise ValueError("token_count_source 가 null 이면 출력 토큰 수도 null 이어야 함")
         return self
 
 

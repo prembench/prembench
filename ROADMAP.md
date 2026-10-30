@@ -33,28 +33,42 @@ environment ("cloud_rented" | "on_prem"), provider (RunPod|Vast|Lambda|null — 
 
 hardware:
   gpu_model, gpu_count, gpu_vram_gb, interconnect (PCIe|NVLink|none),
-  cpu_model, ram_gb, driver_version, cuda_version
+  cpu_model, ram_gb, driver_version, cuda_version,
+  gpu_power_limit_w, gpu_clock_locked (bool), pcie_gen, pcie_lanes, numa_nodes
 
 model:
   hf_id, params_b, quantization (bf16|fp8|awq-int4|gptq-int4|gguf-q4),
-  weight_bytes_gb (safetensors 실측), max_position_embeddings
+  weight_bytes_gb (safetensors 실측), max_position_embeddings,
+  moe (bool), active_params_b, chat_template_applied (bool)
 
 engine:
   name (vllm|sglang|ollama|tgi), version,
   tensor_parallel, pipeline_parallel, max_model_len,
   gpu_memory_utilization, kv_cache_dtype, enable_prefix_caching,
-  extra_args (raw string)
+  extra_args (raw string),
+  attention_backend, cuda_graphs (bool), chunked_prefill (bool),
+  max_num_seqs, max_num_batched_tokens, speculative_decoding ("none"|방식명),
+  engine_commit_or_image_digest
 
 load:
-  concurrency, input_tokens, output_tokens, request_count, warmup_count
+  concurrency, input_tokens, output_tokens, request_count, warmup_count,
+  mode (closed_loop|open_loop), arrival_rate_rps, arrival_process (poisson|constant),
+  random_seed
+  # closed_loop 이면 arrival_rate_rps·arrival_process 는 null, open_loop 이면 필수
 
 result:
   ttft_p50_ms, ttft_p95_ms, ttft_p99_ms,
   tpot_p50_ms, tpot_p95_ms            # time per output token
+  e2e_p50_ms, e2e_p95_ms, e2e_p99_ms, itl_p99_ms
   output_tps_total, output_tps_per_user,
   requests_per_sec, error_count, oom (bool),
   gpu_mem_peak_gb, gpu_util_avg_pct, power_avg_w (nvidia-smi 샘플링)
-  duration_s
+  duration_s,
+  energy_total_j, energy_per_output_token_j,
+  output_tokens_actual_mean, token_count_source (engine_usage|client_tokenizer|null),
+  per_request: [{ttft_ms, e2e_ms, tpot_ms, output_tokens}]   # 측정 구간 요청 전부(실패 포함), 길이 = request_count
+
+# 모든 키는 필수. 재지 못한 값은 null (생략 아님). token_count_source 가 null 이면 토큰 수 필드도 null.
 ```
 
 ### 1.2 측정 격자 (v1)

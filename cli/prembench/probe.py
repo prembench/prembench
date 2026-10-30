@@ -58,6 +58,12 @@ class HostProbe:
             ram_gb=self.ram_gb,
             driver_version=self.driver_version,
             cuda_version=self.cuda_version,
+            # 아래는 아직 probe 하지 않음 → null
+            gpu_power_limit_w=None,
+            gpu_clock_locked=None,
+            pcie_gen=None,
+            pcie_lanes=None,
+            numa_nodes=None,
         )
 
 
