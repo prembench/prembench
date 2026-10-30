@@ -4,20 +4,26 @@ import warnings
 import pytest
 from pydantic import ValidationError
 
-from prembench.schema import Run, SchemaWarning, json_schema
+from prembench.schema import SCHEMA_VERSION, Run, SchemaWarning, json_schema
 
 # 전부 가상 값
 
 
 def _record() -> dict:
     per_request = [
-        {"ttft_ms": 120.0, "e2e_ms": 2600.0, "tpot_ms": 19.5, "output_tokens": 128,
-         "finish_reason": "length", "reasoning_tokens": None},
-        {"ttft_ms": None, "e2e_ms": 30.0, "tpot_ms": None, "output_tokens": None,
-         "finish_reason": "error", "reasoning_tokens": None},  # 실패 요청
+        {"start_s": 0.0, "status": 200, "error": None, "prompt_tokens": 512,
+         "ttft_ms": 120.0, "e2e_ms": 2600.0, "tpot_ms": 19.5, "output_tokens": 128,
+         "finish_reason": "length", "reasoning_tokens": None, "content_empty": False, "itl_max_ms": 31.0},
+        {"start_s": 2.6, "status": 500, "error": "HTTP 500: example failure", "prompt_tokens": None,
+         "ttft_ms": None, "e2e_ms": 30.0, "tpot_ms": None, "output_tokens": None,
+         "finish_reason": "error", "reasoning_tokens": None, "content_empty": False,
+         "itl_max_ms": None},  # 실패 요청
     ]
     return {
+        "schema_version": SCHEMA_VERSION,
+        "prembench_version": "0.0.1",
         "run_id": "example-0001",
+        "batch_id": "example-batch-01",
         "submitted_at": "2026-11-08T12:00:00+09:00",
         "submitter": "example-user",
         "provenance": "self",
@@ -30,12 +36,15 @@ def _record() -> dict:
             "numa_nodes": None,
         },
         "model": {
-            "hf_id": "Qwen/Qwen2.5-7B-Instruct", "params_b": 7.6, "quantization": "bf16",
+            "hf_id": "Qwen/Qwen2.5-7B-Instruct", "params_b": 7.6, "quantization": "none",
+            "weight_dtype": "bf16",
             "weight_bytes_gb": 15.2, "max_position_embeddings": 32768,
             "moe": False, "active_params_b": 7.6, "chat_template_applied": True,
         },
         "engine": {
             "name": "vllm", "version": "0.0.0", "tensor_parallel": 1, "pipeline_parallel": 1,
+            "data_parallel": None, "expert_parallel": None,
+            "server_command": "vllm serve Qwen/Qwen2.5-7B-Instruct --max-model-len 8192",
             "max_model_len": 8192, "gpu_memory_utilization": 0.9, "kv_cache_dtype": "auto",
             "enable_prefix_caching": False, "extra_args": None,
             "attention_backend": "FLASH_ATTN", "cuda_graphs": True, "chunked_prefill": True,
@@ -47,18 +56,19 @@ def _record() -> dict:
             "warmup_count": 1, "mode": "closed_loop", "arrival_rate_rps": None,
             "arrival_process": None, "random_seed": 0,
             "sampling": {"temperature": 0.0, "top_p": 1.0, "repetition_penalty": 1.0,
-                         "max_tokens": 128, "stop": []},
-            "reasoning_enabled": False, "reasoning_budget_tokens": None,
+                         "max_tokens": 128, "stop": [], "seed": 0},
+            "reasoning_enabled": False, "reasoning_budget_tokens": None, "ignore_eos": True,
         },
         "conditions": {
-            "model_load_state": "warm", "colocated_workloads": False, "shared_tenancy_note": None,
+            "measured_from": "same_host", "model_load_state": "warm", "colocated_workloads": False, "shared_tenancy_note": None,
             "gpu_temp_start_c": 41.0, "gpu_temp_end_c": 63.0, "chat_template_variant": None,
         },
         "result": {
             "ttft_p50_ms": 120.0, "ttft_p95_ms": 120.0, "ttft_p99_ms": 120.0,
             "tpot_p50_ms": 19.5, "tpot_p95_ms": 19.5,
-            "e2e_p50_ms": 1315.0, "e2e_p95_ms": 2471.5, "e2e_p99_ms": 2574.3, "itl_p99_ms": 25.0,
-            "output_tps_total": 49.0, "output_tps_per_user": 51.0, "requests_per_sec": 0.38,
+            "e2e_p50_ms": 1315.0, "e2e_p95_ms": 2471.5, "e2e_p99_ms": 2574.3,
+            "itl_p50_ms": 19.0, "itl_p95_ms": 22.0, "itl_p99_ms": 25.0,
+            "output_tps_total": 49.0, "output_tps_per_user": 49.0, "requests_per_sec": 0.38,
             "error_count": 1, "oom": False,
             "gpu_mem_peak_gb": None, "gpu_util_avg_pct": None, "power_avg_w": None,
             "duration_s": 2.63, "energy_total_j": None, "energy_per_output_token_j": None,
@@ -114,6 +124,24 @@ def test_valid_record():
         "result.prefix_cache_hit_rate",
         "result.per_request.0.finish_reason",
         "result.per_request.0.reasoning_tokens",
+        "schema_version",
+        "prembench_version",
+        "batch_id",
+        "model.weight_dtype",
+        "engine.data_parallel",
+        "engine.expert_parallel",
+        "engine.server_command",
+        "load.ignore_eos",
+        "load.sampling.seed",
+        "result.per_request.0.start_s",
+        "result.per_request.0.prompt_tokens",
+        "result.per_request.0.content_empty",
+        "result.per_request.0.status",
+        "result.per_request.0.error",
+        "result.per_request.0.itl_max_ms",
+        "result.itl_p50_ms",
+        "result.itl_p95_ms",
+        "conditions.measured_from",
     ],
 )
 def test_new_fields_are_required_keys(path):
@@ -225,3 +253,100 @@ def test_reasoning_budget_requires_reasoning_enabled():
 def test_conditions_model_load_state_enum():
     with pytest.raises(ValidationError):
         Run.model_validate(_with("conditions.model_load_state", "lukewarm"))
+
+
+# ---- v1.0
+
+
+def test_vendor_provenance_and_free_provider():
+    rec = _with("provenance", "vendor")
+    rec["provider"] = "SomeNewCloud"
+    Run.model_validate(rec)
+
+
+def test_schema_version_format():
+    with pytest.raises(ValidationError):
+        Run.model_validate(_with("schema_version", "v1"))
+
+
+def test_quantization_free_string():
+    rec = _with("model.quantization", "gguf-q4_k_m")
+    rec["model"]["weight_dtype"] = None
+    Run.model_validate(rec)
+
+
+def test_quantization_none_requires_weight_dtype():
+    with pytest.raises(ValidationError, match="weight_dtype"):
+        Run.model_validate(_with("model.weight_dtype", None))
+
+
+def test_data_parallel_counts_toward_gpu_count():
+    with pytest.raises(ValidationError, match="gpu_count"):
+        Run.model_validate(_with("engine.data_parallel", 2))
+
+
+def test_output_tokens_equals_max_tokens():
+    with pytest.raises(ValidationError, match="sampling.max_tokens"):
+        Run.model_validate(_with("load.sampling.max_tokens", 256))
+
+
+def test_per_request_e2e_ge_ttft():
+    with pytest.raises(ValidationError, match="e2e_ms"):
+        Run.model_validate(_with("result.per_request.0.e2e_ms", 100.0))
+
+
+def test_per_request_error_max_200_chars():
+    with pytest.raises(ValidationError):
+        Run.model_validate(_with("result.per_request.1.error", "x" * 201))
+    Run.model_validate(_with("result.per_request.1.error", "x" * 200))
+
+
+def test_itl_percentiles_monotonic():
+    with pytest.raises(ValidationError, match="itl"):
+        Run.model_validate(_with("result.itl_p50_ms", 30.0))
+
+
+def test_content_empty_rate_must_match_per_request():
+    with pytest.raises(ValidationError, match="content_empty_rate"):
+        Run.model_validate(_with("result.content_empty_rate", 0.5))
+    rec = _with("result.content_empty_rate", 0.5)
+    rec["result"]["per_request"][0]["content_empty"] = True
+    Run.model_validate(rec)
+
+
+def test_measured_from_enum():
+    with pytest.raises(ValidationError):
+        Run.model_validate(_with("conditions.measured_from", "cloud"))
+
+
+def test_remote_with_null_host_metrics_is_valid():
+    rec = _with("conditions.measured_from", "remote")
+    rec["conditions"].update(gpu_temp_start_c=None, gpu_temp_end_c=None, colocated_workloads=None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Run.model_validate(rec)
+
+
+def test_warn_concurrency_over_max_num_seqs():
+    rec = _with("engine.max_num_seqs", 1)
+    rec["load"]["concurrency"] = 2
+    rec["result"]["output_tps_per_user"] = 24.5
+    with pytest.warns(SchemaWarning, match="max_num_seqs"):
+        run = Run.model_validate(rec)
+    assert any("max_num_seqs" in m for m in run.lint())
+
+
+def test_warn_ignore_eos_but_stopped():
+    rec = copy.deepcopy(_record())
+    rec["result"]["per_request"][0]["finish_reason"] = "stop"
+    rec["result"]["finish_reason_counts"] = {"stop": 1, "length": 0, "error": 1, "other": 0}
+    with pytest.warns(SchemaWarning, match="ignore_eos"):
+        Run.model_validate(rec)
+
+
+def test_warn_prefix_cache_hit_rate():
+    with pytest.warns(SchemaWarning, match="prefix_cache_hit_rate"):
+        Run.model_validate(_with("result.prefix_cache_hit_rate", 0.2))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Run.model_validate(_with("result.prefix_cache_hit_rate", 0.05))

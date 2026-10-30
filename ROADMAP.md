@@ -23,11 +23,12 @@
 
 ## 1. 측정 설계 (스키마가 제품이다)
 
-### 1.1 레코드 필수 필드
+### 1.1 레코드 필수 필드 (schema_version 1.0)
 
 ```
-run_id, submitted_at, submitter (handle), provenance ("self" | "community" | "scraped")
-environment ("cloud_rented" | "on_prem"), provider (RunPod|Vast|Lambda|null — on_prem 이면 null)
+schema_version ("1.0"), prembench_version, run_id, batch_id (격자 1회 실행 묶음|null),
+submitted_at, submitter (handle), provenance ("self" | "community" | "scraped" | "vendor")
+environment ("cloud_rented" | "on_prem"), provider (자유 문자열 예: RunPod|Vast|Lambda, on_prem 이면 null)
   # 사이트의 모든 셀에 environment 를 표시한다. "온프레미스에서 쟀다"고 말하지 않는다.
   # 온프레미스는 대상 독자를 뜻하는 말이지 측정 장소를 주장하는 말이 아니다.
 
@@ -37,53 +38,67 @@ hardware:
   gpu_power_limit_w, gpu_clock_locked (bool), pcie_gen, pcie_lanes, numa_nodes
 
 model:
-  hf_id, params_b, quantization (bf16|fp8|awq-int4|gptq-int4|gguf-q4),
+  hf_id, params_b,
+  quantization (자유 문자열, 양자화 안 했으면 "none". 정규화는 사이트 몫),
+  weight_dtype (bf16|fp16|fp8 … quantization="none" 이면 필수),
   weight_bytes_gb (safetensors 실측), max_position_embeddings,
-  moe (bool), active_params_b, chat_template_applied (bool)
+  moe (bool), active_params_b (<= params_b), chat_template_applied (bool)
 
 engine:
-  name (vllm|sglang|ollama|tgi), version,
-  tensor_parallel, pipeline_parallel, max_model_len,
-  gpu_memory_utilization, kv_cache_dtype, enable_prefix_caching,
-  extra_args (raw string),
+  name (vllm|sglang|ollama|tgi), version, engine_commit_or_image_digest,
+  tensor_parallel, pipeline_parallel, data_parallel, expert_parallel,
+  # tensor × pipeline × (data or 1) <= gpu_count
+  max_model_len, gpu_memory_utilization, kv_cache_dtype, enable_prefix_caching,
   attention_backend, cuda_graphs (bool), chunked_prefill (bool),
   max_num_seqs, max_num_batched_tokens, speculative_decoding ("none"|방식명),
-  engine_commit_or_image_digest
+  server_command (서버 시작 명령 원문), extra_args (server_command 중 파싱 안 된 나머지)
 
 load:
   concurrency, input_tokens, output_tokens, request_count, warmup_count,
   # input_tokens = 엔진이 본 전체 프롬프트 토큰 (chat template 포함) = usage.prompt_tokens
   mode (closed_loop|open_loop), arrival_rate_rps, arrival_process (poisson|constant),
   random_seed,
-  sampling: {temperature, top_p, repetition_penalty, max_tokens, stop: [str]}   # null 불가, 측정 시 반드시 기록
-  reasoning_enabled (bool|null), reasoning_budget_tokens (int|null)
+  sampling: {temperature, top_p, repetition_penalty, max_tokens, stop: [str], seed (int|null)}   # null 불가
+  reasoning_enabled (bool|null), reasoning_budget_tokens (int|null), ignore_eos (bool|null)
   # closed_loop 이면 arrival_rate_rps·arrival_process 는 null, open_loop 이면 필수
   # reasoning_budget_tokens 는 reasoning_enabled=true 일 때만
+  # output_tokens == sampling.max_tokens
 
 conditions:                           # 측정 당시 조건
+  measured_from (same_host|remote),
+  # remote 면 GPU 호스트를 못 보므로 gpu_mem_peak_gb·gpu_util_avg_pct·power_avg_w·energy_*·gpu_temp_*·
+  # colocated_workloads 가 null 인 게 정상
   model_load_state (cold|warm), colocated_workloads (bool|null), shared_tenancy_note,
-  gpu_temp_start_c, gpu_temp_end_c (측정 구간 시작·종료, nvidia-smi, 여러 장이면 최댓값),
+  gpu_temp_start_c, gpu_temp_end_c (측정 구간 시작·종료, nvidia-smi, 다중 GPU 면 장당 최대),
   chat_template_variant (템플릿 이름 또는 해시)
 
 result:
   ttft_p50_ms, ttft_p95_ms, ttft_p99_ms,
   tpot_p50_ms, tpot_p95_ms            # time per output token
-  e2e_p50_ms, e2e_p95_ms, e2e_p99_ms, itl_p99_ms
-  output_tps_total, output_tps_per_user,
+  e2e_p50_ms, e2e_p95_ms, e2e_p99_ms,
+  itl_p50_ms, itl_p95_ms, itl_p99_ms  # 백분위는 모두 단조 증가
+  output_tps_total, output_tps_per_user (= output_tps_total / concurrency),
   requests_per_sec, error_count, oom (bool),
-  gpu_mem_peak_gb, gpu_util_avg_pct, power_avg_w (nvidia-smi 샘플링)
+  gpu_mem_peak_gb (다중 GPU 면 장당 최대), gpu_util_avg_pct (전 GPU 평균),
+  power_avg_w (전 GPU 합)             # nvidia-smi 1초 샘플링
   duration_s,
-  energy_total_j, energy_per_output_token_j,
+  energy_total_j (전 GPU 합), energy_per_output_token_j,
   output_tokens_actual_mean, token_count_source (engine_usage|client_tokenizer|null),
   reasoning_tokens_mean, content_tokens_mean (엔진이 분리해 주지 않으면 null),
   finish_reason_counts: {stop, length, error, other}   # 합 == request_count, error == error_count
-  content_empty_rate (성공했지만 본문이 빈 요청 수 / request_count),
+  content_empty_rate (= per_request 의 content_empty 비율),
   prefix_cache_hit_rate (엔진 메트릭, 없으면 null),
-  per_request: [{ttft_ms, e2e_ms, tpot_ms, output_tokens, finish_reason, reasoning_tokens}]
+  per_request: [{start_s (측정 시작 기준 초), status, error (200자 절단), prompt_tokens,
+                 ttft_ms, e2e_ms (>= ttft_ms), tpot_ms, itl_max_ms, output_tokens,
+                 finish_reason, reasoning_tokens, content_empty (bool)}]
     # 측정 구간 요청 전부(실패 포함), 길이 = request_count, finish_reason 집계 = finish_reason_counts
 
 # 모든 키는 필수. 재지 못한 값은 null (생략 아님). token_count_source 가 null 이면 토큰 수 필드도 null.
-# reasoning_enabled=true 인데 reasoning_tokens_mean=null 이면 경고(거부 아님) — 사이트에서 "추론 토큰 미분리"로 구분 표시.
+# 경고(SchemaWarning, 거부 아님 — 사이트에서 구분 표시):
+#   - reasoning_enabled=true 인데 reasoning_tokens_mean=null ("추론 토큰 미분리")
+#   - concurrency > max_num_seqs (초과분은 엔진 대기열)
+#   - ignore_eos=true 인데 finish_reason_counts.stop > 0 (엔진이 ignore_eos 를 적용 안 했을 수 있음)
+#   - prefix_cache_hit_rate > 0.05 (캐시가 결과를 부풀렸을 수 있음)
 ```
 
 ### 1.2 측정 격자 (v1)

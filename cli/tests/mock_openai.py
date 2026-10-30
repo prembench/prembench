@@ -26,6 +26,7 @@ class MockConfig:
     tokens: int = 8  # 본문 토큰 수. 추론 토큰과 합해 max_tokens 를 넘으면 잘린다
     reasoning_tokens: int = 0  # 본문 앞에 reasoning_content 로 보낼 토큰 수
     fail_requests: frozenset[int] = frozenset()  # 500 을 돌려줄 요청 번호 (1부터, 준비 확인 포함)
+    error_message: str = "mock failure"
     send_usage: bool = True
     # 본문 문자열 → usage.prompt_tokens. 엔진의 토크나이저 + chat template 역할
     prompt_tokens: Callable[[str], int] = lambda content: 5
@@ -48,7 +49,7 @@ def make_app(cfg: MockConfig, state: MockState) -> FastAPI:
         state.requests += 1
         state.bodies.append(body)
         if state.requests in cfg.fail_requests:
-            return JSONResponse({"error": {"message": "mock failure"}}, status_code=500)
+            return JSONResponse({"error": {"message": cfg.error_message}}, status_code=500)
 
         limit = body.get("max_tokens") or (cfg.reasoning_tokens + cfg.tokens)
         n_reason = min(cfg.reasoning_tokens, limit)

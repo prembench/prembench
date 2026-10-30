@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(not URL, reason="PREMBENCH_OLLAMA_URL 미설정"
 async def test_ollama_streaming_one_cell():
     run = await run_load(
         URL, MODEL, ["Count from 1 to 100 separated by spaces."],
-        sampling=Sampling(temperature=0.0, top_p=1.0, repetition_penalty=1.0, max_tokens=32, stop=[]),
+        sampling=Sampling(temperature=0.0, top_p=1.0, repetition_penalty=1.0, max_tokens=32, stop=[], seed=None),
         concurrency=2, request_count=4, warmup_count=1,
     )
     assert run.ready.ok
@@ -33,6 +33,9 @@ async def test_ollama_streaming_one_cell():
         assert r.finish_reason in ("stop", "length")
     # 맥북엔 nvidia-smi 가 없으므로 null
     assert run.gpu_temp_start_c is None
+    # 실제 엔진 응답이 스키마 PerRequest 를 통과해야 한다
+    pr = run.per_request()
+    assert all(p.prompt_tokens and p.e2e_ms >= p.ttft_ms for p in pr)
 
 
 async def test_ollama_exact_input_tokens():
@@ -46,7 +49,7 @@ async def test_ollama_exact_input_tokens():
         prompts = build_prompts(tok, 2, content_tokens_for(target, overhead), seed=0, ko_ratio=ko, pools=pools)
         run = await run_load(
             URL, MODEL, prompts,
-            sampling=Sampling(temperature=0.0, top_p=1.0, repetition_penalty=1.0, max_tokens=2, stop=[]),
+            sampling=Sampling(temperature=0.0, top_p=1.0, repetition_penalty=1.0, max_tokens=2, stop=[], seed=None),
             concurrency=1, request_count=2,
         )
         assert [r.prompt_tokens for r in run.records] == [target, target]

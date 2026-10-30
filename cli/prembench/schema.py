@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections import Counter
 from datetime import datetime
@@ -15,17 +16,20 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-Provenance = Literal["self", "community", "scraped"]
+SCHEMA_VERSION = "1.0"
+_ERROR_MAX_CHARS = 200
+_PREFIX_CACHE_WARN = 0.05
+
+Provenance = Literal["self", "community", "scraped", "vendor"]
 Environment = Literal["cloud_rented", "on_prem"]
-Provider = Literal["RunPod", "Vast", "Lambda"]
 Interconnect = Literal["PCIe", "NVLink", "none"]
-Quantization = Literal["bf16", "fp8", "awq-int4", "gptq-int4", "gguf-q4"]
 EngineName = Literal["vllm", "sglang", "ollama", "tgi"]
 LoadMode = Literal["closed_loop", "open_loop"]
 ArrivalProcess = Literal["poisson", "constant"]
 TokenCountSource = Literal["engine_usage", "client_tokenizer"]
 FinishReason = Literal["stop", "length", "error", "other"]
 ModelLoadState = Literal["cold", "warm"]
+MeasuredFrom = Literal["same_host", "remote"]
 
 
 class SchemaWarning(UserWarning):
@@ -56,7 +60,14 @@ class Hardware(_Strict):
 class Model(_Strict):
     hf_id: str = Field(description="Hugging Face 리포 ID. 예: 'Qwen/Qwen2.5-7B-Instruct'")
     params_b: float = Field(gt=0, description="파라미터 수, 단위 십억(B)")
-    quantization: Quantization = Field(description="가중치 양자화 방식")
+    quantization: str = Field(
+        min_length=1,
+        description="가중치 양자화 방식 원문. 예: 'awq-int4', 'gptq-int4', 'fp8', 'gguf-q4_k_m'. "
+        "양자화 안 했으면 'none'. 이름 정규화는 사이트 몫",
+    )
+    weight_dtype: str | None = Field(
+        description="가중치 dtype. 예: 'bf16', 'fp16', 'fp8'. quantization='none' 이면 필수"
+    )
     weight_bytes_gb: float | None = Field(
         gt=0, description="safetensors 파일 합계 실측 크기, 단위 GB"
     )
@@ -75,6 +86,8 @@ class Model(_Strict):
     def _check_active_params(self) -> Model:
         if self.active_params_b is not None and self.active_params_b > self.params_b:
             raise ValueError(f"active_params_b({self.active_params_b}) > params_b({self.params_b})")
+        if self.quantization == "none" and self.weight_dtype is None:
+            raise ValueError("quantization='none' 이면 weight_dtype 이 필요함")
         return self
 
 
@@ -83,13 +96,18 @@ class Engine(_Strict):
     version: str = Field(description="엔진 버전 문자열")
     tensor_parallel: int = Field(ge=1, description="텐서 병렬 크기")
     pipeline_parallel: int = Field(ge=1, description="파이프라인 병렬 크기")
+    data_parallel: int | None = Field(ge=1, description="데이터 병렬 크기 (엔진 내부 복제 수)")
+    expert_parallel: int | None = Field(ge=1, description="전문가(MoE expert) 병렬 크기")
     max_model_len: int | None = Field(ge=1, description="엔진에 설정한 최대 시퀀스 길이, 단위 토큰")
     gpu_memory_utilization: float | None = Field(
         gt=0, le=1, description="엔진에 설정한 GPU 메모리 사용 비율 (0~1)"
     )
     kv_cache_dtype: str | None = Field(description="KV 캐시 dtype. 예: 'auto', 'fp8'")
     enable_prefix_caching: bool | None = Field(description="prefix 캐싱 활성화 여부")
-    extra_args: str | None = Field(description="그 밖의 엔진 실행 인자 원문")
+    server_command: str | None = Field(description="엔진 서버 시작 명령 원문 (비밀값은 지우고)")
+    extra_args: str | None = Field(
+        description="server_command 중 이 스키마의 다른 필드로 파싱되지 않은 나머지 인자 원문"
+    )
     attention_backend: str | None = Field(description="어텐션 백엔드. 예: 'FLASH_ATTN', 'FLASHINFER'")
     cuda_graphs: bool | None = Field(description="CUDA graph 사용 여부 (vLLM --enforce-eager 면 false)")
     chunked_prefill: bool | None = Field(description="chunked prefill 활성화 여부")
@@ -109,6 +127,7 @@ class Sampling(_Strict):
     repetition_penalty: float = Field(gt=0, description="반복 패널티. 1.0 이면 없음")
     max_tokens: int = Field(ge=1, description="요청당 최대 출력 토큰, 단위 토큰")
     stop: list[str] = Field(description="stop 문자열 목록. 없으면 빈 배열")
+    seed: int | None = Field(description="요청에 실어 보낸 샘플링 seed. 보내지 않았으면 null")
 
 
 class Load(_Strict):
@@ -134,6 +153,9 @@ class Load(_Strict):
     reasoning_budget_tokens: int | None = Field(
         ge=0, description="추론 토큰 예산, 단위 토큰. 예산을 걸지 않았으면 null"
     )
+    ignore_eos: bool | None = Field(
+        description="EOS 를 무시하고 max_tokens 까지 생성하게 했는지 (vLLM·SGLang ignore_eos). 모르면 null"
+    )
 
     @model_validator(mode="after")
     def _check_mode(self) -> Load:
@@ -144,12 +166,22 @@ class Load(_Strict):
             raise ValueError("mode='closed_loop' 이면 arrival_rate_rps, arrival_process 는 null 이어야 함")
         if self.reasoning_budget_tokens is not None and self.reasoning_enabled is not True:
             raise ValueError("reasoning_budget_tokens 는 reasoning_enabled=true 일 때만 기록")
+        if self.output_tokens != self.sampling.max_tokens:
+            raise ValueError(
+                f"output_tokens({self.output_tokens}) != sampling.max_tokens({self.sampling.max_tokens})"
+            )
         return self
 
 
 class PerRequest(_Strict):
     """측정 구간 요청 1개의 원시값. 실패 요청도 포함하며 재지 못한 값은 null."""
 
+    start_s: float = Field(ge=0, description="측정 구간 시작 기준 요청 송신 시각, 단위 초")
+    status: int | None = Field(description="HTTP 상태 코드. 응답을 못 받았으면(연결 실패 등) null")
+    error: str | None = Field(
+        max_length=_ERROR_MAX_CHARS, description=f"실패 사유 원문 ({_ERROR_MAX_CHARS}자에서 절단). 성공이면 null"
+    )
+    prompt_tokens: int | None = Field(ge=0, description="엔진이 보고한 프롬프트 토큰 수 (usage). 없으면 null")
     ttft_ms: float | None = Field(ge=0, description="첫 토큰까지 시간, 단위 ms")
     e2e_ms: float | None = Field(ge=0, description="요청 송신~응답 종료, 단위 ms")
     tpot_ms: float | None = Field(
@@ -162,6 +194,16 @@ class PerRequest(_Strict):
     reasoning_tokens: int | None = Field(
         ge=0, description="출력 토큰 중 추론 토큰 수. 엔진이 분리해 주지 않으면 null"
     )
+    content_empty: bool = Field(description="성공했지만 본문(추론 제외)이 비었는지. 실패 요청은 false")
+    itl_max_ms: float | None = Field(
+        ge=0, description="이 요청의 연속 토큰(청크) 도착 간격 최댓값, 단위 ms. 청크가 2개 미만이면 null"
+    )
+
+    @model_validator(mode="after")
+    def _check_e2e(self) -> PerRequest:
+        if self.ttft_ms is not None and self.e2e_ms is not None and self.e2e_ms < self.ttft_ms:
+            raise ValueError(f"e2e_ms({self.e2e_ms}) < ttft_ms({self.ttft_ms})")
+        return self
 
 
 class FinishReasonCounts(_Strict):
@@ -184,22 +226,28 @@ class Result(_Strict):
     e2e_p50_ms: float | None = Field(ge=0, description="요청 전체 지연 p50, 단위 ms")
     e2e_p95_ms: float | None = Field(ge=0, description="요청 전체 지연 p95, 단위 ms")
     e2e_p99_ms: float | None = Field(ge=0, description="요청 전체 지연 p99, 단위 ms")
+    itl_p50_ms: float | None = Field(ge=0, description="연속 토큰(청크) 도착 간격 p50, 단위 ms")
+    itl_p95_ms: float | None = Field(ge=0, description="연속 토큰(청크) 도착 간격 p95, 단위 ms")
     itl_p99_ms: float | None = Field(ge=0, description="연속 토큰(청크) 도착 간격 p99, 단위 ms")
     output_tps_total: float | None = Field(ge=0, description="전체 출력 처리량, 단위 tokens/s")
     output_tps_per_user: float | None = Field(
-        ge=0, description="요청(사용자) 1개당 출력 처리량, 단위 tokens/s"
+        ge=0, description="사용자 1명당 출력 처리량 = output_tps_total / concurrency, 단위 tokens/s"
     )
     requests_per_sec: float | None = Field(ge=0, description="완료 요청 처리량, 단위 req/s")
     error_count: int = Field(ge=0, description="실패한 요청 수")
     oom: bool = Field(description="OOM 발생 여부. OOM 셀도 기록한다")
-    gpu_mem_peak_gb: float | None = Field(ge=0, description="GPU 메모리 최대 사용량, 단위 GB (nvidia-smi)")
-    gpu_util_avg_pct: float | None = Field(
-        ge=0, le=100, description="GPU 사용률 평균, 단위 % (nvidia-smi 1초 샘플링)"
+    gpu_mem_peak_gb: float | None = Field(
+        ge=0, description="GPU 메모리 최대 사용량, 단위 GB (nvidia-smi). 다중 GPU 면 장당 최대값"
     )
-    power_avg_w: float | None = Field(ge=0, description="GPU 전력 평균, 단위 W (nvidia-smi 1초 샘플링)")
+    gpu_util_avg_pct: float | None = Field(
+        ge=0, le=100, description="GPU 사용률 평균, 단위 % (nvidia-smi 1초 샘플링). 다중 GPU 면 전 GPU 평균"
+    )
+    power_avg_w: float | None = Field(
+        ge=0, description="GPU 전력 평균, 단위 W (nvidia-smi 1초 샘플링). 다중 GPU 면 전 GPU 합"
+    )
     duration_s: float | None = Field(ge=0, description="측정 구간 길이, 단위 초")
     energy_total_j: float | None = Field(
-        ge=0, description="측정 구간 GPU 에너지 합계, 단위 J (nvidia-smi 전력 샘플 적분)"
+        ge=0, description="측정 구간 GPU 에너지 합계, 단위 J (nvidia-smi 전력 샘플 적분). 다중 GPU 면 전 GPU 합"
     )
     energy_per_output_token_j: float | None = Field(
         ge=0, description="energy_total_j / 측정 구간 출력 토큰 합계, 단위 J/token"
@@ -221,7 +269,7 @@ class Result(_Strict):
     )
     content_empty_rate: float = Field(
         ge=0, le=1,
-        description="성공했지만 본문이 빈 요청 수 / request_count (추론만 하고 끝난 경우 등)",
+        description="per_request 중 content_empty=true 비율 = 성공했지만 본문이 빈 요청 수 / request_count",
     )
     prefix_cache_hit_rate: float | None = Field(
         ge=0, le=1, description="엔진 메트릭의 prefix 캐시 적중률 (0~1). 엔진이 안 주면 null"
@@ -234,6 +282,7 @@ class Result(_Strict):
             ("ttft", (self.ttft_p50_ms, self.ttft_p95_ms, self.ttft_p99_ms)),
             ("tpot", (self.tpot_p50_ms, self.tpot_p95_ms)),
             ("e2e", (self.e2e_p50_ms, self.e2e_p95_ms, self.e2e_p99_ms)),
+            ("itl", (self.itl_p50_ms, self.itl_p95_ms, self.itl_p99_ms)),
         ):
             vals = [v for v in seq if v is not None]
             if vals != sorted(vals):
@@ -244,18 +293,24 @@ class Result(_Strict):
 class Conditions(_Strict):
     """측정 당시 조건. 같은 하드웨어·설정이라도 결과를 바꾸는 것들."""
 
+    measured_from: MeasuredFrom = Field(
+        description="부하 생성기 위치. same_host: GPU 서버에서 직접 / remote: 네트워크 너머 다른 호스트. "
+        "remote 면 GPU 호스트를 들여다볼 수 없으므로 gpu_mem_peak_gb·gpu_util_avg_pct·power_avg_w·"
+        "energy_*·gpu_temp_*·colocated_workloads 가 null 인 게 정상"
+    )
+
     model_load_state: ModelLoadState = Field(
         description="측정 직전 모델 상태. cold: 엔진 기동 직후 첫 측정 / warm: 이미 요청을 처리한 엔진"
     )
     colocated_workloads: bool | None = Field(
-        description="측정 중 같은 GPU 에 다른 프로세스가 있었는지. 확인 못 했으면 null"
+        description="측정 중 같은 GPU 에 다른 프로세스가 있었는지. 확인 못 했으면(remote 등) null"
     )
     shared_tenancy_note: str | None = Field(description="자원 공유 상황 메모 (자유 서술)")
     gpu_temp_start_c: float | None = Field(
-        description="측정 구간 시작 시 GPU 온도, 단위 °C (nvidia-smi, 여러 장이면 최댓값)"
+        description="측정 구간 시작 시 GPU 온도, 단위 °C (nvidia-smi). 다중 GPU 면 장당 최대값. remote 면 보통 null"
     )
     gpu_temp_end_c: float | None = Field(
-        description="측정 구간 종료 시 GPU 온도, 단위 °C (nvidia-smi, 여러 장이면 최댓값)"
+        description="측정 구간 종료 시 GPU 온도, 단위 °C (nvidia-smi). 다중 GPU 면 장당 최대값. remote 면 보통 null"
     )
     chat_template_variant: str | None = Field(description="적용한 chat template 이름 또는 해시")
 
@@ -263,14 +318,21 @@ class Conditions(_Strict):
 class Run(_Strict):
     """측정 레코드 1건 = (하드웨어, 모델, 엔진, 부하) 격자 셀 1개의 실측 결과."""
 
+    schema_version: str = Field(
+        pattern=r"^\d+\.\d+$", description=f"이 레코드가 따르는 스키마 버전. 현재 '{SCHEMA_VERSION}'"
+    )
+    prembench_version: str = Field(min_length=1, description="레코드를 만든 prembench CLI 버전")
     run_id: str = Field(min_length=1, description="레코드 고유 ID")
+    batch_id: str | None = Field(description="한 번의 격자 실행에서 함께 나온 레코드 묶음 ID")
     submitted_at: datetime = Field(description="제출 시각 (ISO 8601, 타임존 포함)")
     submitter: str = Field(min_length=1, description="제출자 핸들")
     provenance: Provenance = Field(description="출처: 직접 측정 / 커뮤니티 제출 / 외부 수집")
     environment: Environment = Field(
         description="측정 장소. 사이트의 모든 셀에 표시한다. '온프레미스'는 대상 독자이지 측정 장소 주장이 아니다"
     )
-    provider: Provider | None = Field(description="클라우드 제공자. on_prem 이면 null")
+    provider: str | None = Field(
+        min_length=1, description="클라우드 제공자. 예: 'RunPod', 'Vast', 'Lambda'. on_prem 이면 null"
+    )
 
     hardware: Hardware
     model: Model
@@ -287,10 +349,11 @@ class Run(_Strict):
             raise ValueError("environment='cloud_rented' 이면 provider 가 필요함")
         if self.submitted_at.tzinfo is None:
             raise ValueError("submitted_at 에 타임존이 없음")
-        used = self.engine.tensor_parallel * self.engine.pipeline_parallel
+        e = self.engine
+        used = e.tensor_parallel * e.pipeline_parallel * (e.data_parallel or 1)
         if used > self.hardware.gpu_count:
             raise ValueError(
-                f"tensor_parallel×pipeline_parallel({used}) > gpu_count({self.hardware.gpu_count})"
+                f"tensor×pipeline×data parallel({used}) > gpu_count({self.hardware.gpu_count})"
             )
         if len(self.result.per_request) != self.load.request_count:
             raise ValueError(
@@ -315,14 +378,35 @@ class Run(_Strict):
                 f"finish_reason_counts.error({frc.error}) != error_count({self.result.error_count})"
             )
 
-        if self.load.reasoning_enabled and self.result.reasoning_tokens_mean is None:
-            warnings.warn(
-                f"run {self.run_id}: reasoning_enabled=true 인데 reasoning_tokens_mean 이 null "
-                "— 추론/본문 토큰 미분리 레코드로 표시",
-                SchemaWarning,
-                stacklevel=2,
+        empty = sum(r.content_empty for r in self.result.per_request) / self.load.request_count
+        if not math.isclose(self.result.content_empty_rate, empty, abs_tol=1e-9):
+            raise ValueError(
+                f"content_empty_rate({self.result.content_empty_rate}) != per_request 집계({empty})"
             )
+
+        for msg in self.lint():
+            warnings.warn(f"run {self.run_id}: {msg}", SchemaWarning, stacklevel=2)
         return self
+
+    def lint(self) -> list[str]:
+        """거부하지 않지만 사이트에서 구분 표시할 사항."""
+        out = []
+        if self.load.reasoning_enabled and self.result.reasoning_tokens_mean is None:
+            out.append("reasoning_enabled=true 인데 reasoning_tokens_mean 이 null — 추론/본문 토큰 미분리")
+        if self.engine.max_num_seqs is not None and self.load.concurrency > self.engine.max_num_seqs:
+            out.append(
+                f"concurrency({self.load.concurrency}) > max_num_seqs({self.engine.max_num_seqs}) "
+                "— 초과분은 엔진 대기열에서 기다림"
+            )
+        if self.load.ignore_eos and self.result.finish_reason_counts.stop > 0:
+            out.append(
+                f"ignore_eos=true 인데 stop 종료 {self.result.finish_reason_counts.stop}건 "
+                "— 엔진이 ignore_eos 를 적용하지 않았을 수 있음"
+            )
+        hit = self.result.prefix_cache_hit_rate
+        if hit is not None and hit > _PREFIX_CACHE_WARN:
+            out.append(f"prefix_cache_hit_rate({hit}) > {_PREFIX_CACHE_WARN} — 캐시가 결과를 부풀렸을 수 있음")
+        return out
 
 
 def json_schema() -> dict:
